@@ -59,7 +59,7 @@ from main_comparison import (
 
 # Configuration
 FIXED_N = 1000  # Fixed training set size - always use 1000 graphs from S1 and S2
-NODE_SIZES = [5, 10, 20, 30, 40, 50, 100,500]  # Graph complexities to test (loop over n)
+NODE_SIZES = [5,10,20,30,50,100,500]  # Graph complexities to test (loop over n)
 TEST_SET_SIZE = 100  # Conditioning graphs
 SPLIT_SEED = 42
 
@@ -76,8 +76,9 @@ HIDDEN_DIM_DECODER = 64
 HIDDEN_DIM_DENOISE = 512
 N_MAX_NODES = 500  # Maximum nodes (capped for computational feasibility)
 N_PROPERTIES = 15  # Updated from 18 to match labelhomgenerator (no structural/feature homophily)
-TIMESTEPS = 500
+TIMESTEPS = 100
 NUM_SAMPLES_PER_CONDITION = 5
+K_NEAREST = 200  # shortlist size for k-nearest training comparisons
 
 BETA_KL_WEIGHT = 0.05
 SMALL_DATASET_THRESHOLD = 50
@@ -85,6 +86,90 @@ SMALL_DATASET_KL_WEIGHT = 0.01
 SMALL_DATASET_DROPOUT = 0.1
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+
+# --- WL helpers: force degree-only similarity regardless of available features ---
+def _strip_features(G):
+    """Return a copy of G with any 'feature_vector' removed from nodes."""
+    Gc = G.copy()
+    for n in Gc.nodes:
+        if 'feature_vector' in Gc.nodes[n]:
+            try:
+                del Gc.nodes[n]['feature_vector']
+            except Exception:
+                Gc.nodes[n]['feature_vector'] = None
+    return Gc
+
+
+def wl_similarity_degree_only(G1, G2):
+    """Compute WL similarity using degree-only labels by stripping node features."""
+    return compute_wl_similarity(_strip_features(G1), _strip_features(G2))
+
+
+def find_closest_graph_in_training_degree_only(generated_G, training_graphs_nx):
+    """Nearest neighbor in training under degree-only WL similarity."""
+    best_sim = -1.0
+    closest_G = None
+    g = _strip_features(generated_G)
+    for G_train in training_graphs_nx:
+        sim = compute_wl_similarity(g, _strip_features(G_train))
+        if sim > best_sim:
+            best_sim = sim
+            closest_G = G_train
+    return closest_G, best_sim
+
+
+def _degree_histogram_normalized(G, n_bins):
+    """Return normalized degree histogram of length n_bins (0..n_bins-1)."""
+    hist = np.zeros(n_bins, dtype=np.float32)
+    if G.number_of_nodes() == 0:
+        return hist
+    for _, deg in G.degree():
+        b = int(deg)
+        if b >= n_bins:
+            b = n_bins - 1
+        hist[b] += 1.0
+    hist_sum = hist.sum()
+    if hist_sum > 0:
+        hist /= hist_sum
+    return hist
+
+
+def _precompute_degree_hists(training_graphs_nx, n_bins):
+    return np.stack([_degree_histogram_normalized(G, n_bins) for G in training_graphs_nx], axis=0) if len(training_graphs_nx) > 0 else np.zeros((0, n_bins), dtype=np.float32)
+
+
+def _k_nearest_indices_by_deg_hist(generated_G, train_hists, n_bins, k):
+    """Return indices of k nearest training graphs by L1 distance on degree histograms."""
+    if train_hists.shape[0] == 0:
+        return []
+    g_hist = _degree_histogram_normalized(generated_G, n_bins)
+    dists = np.sum(np.abs(train_hists - g_hist[None, :]), axis=1)
+    k_eff = int(min(max(k, 1), train_hists.shape[0]))
+    idxs = np.argpartition(dists, kth=k_eff-1)[:k_eff]
+    # sort these k by distance for determinism
+    idxs = idxs[np.argsort(dists[idxs])]
+    return idxs.tolist()
+
+
+def find_closest_graph_in_training_degree_only_k(generated_G, training_graphs_nx, train_hists, n_bins, k):
+    """Find best match using degree-only WL within k-nearest by degree-hist prefilter."""
+    if len(training_graphs_nx) == 0:
+        return None, 0.0
+    cand_idxs = _k_nearest_indices_by_deg_hist(generated_G, train_hists, n_bins, k)
+    best_sim = -1.0
+    best_G = None
+    for idx in cand_idxs:
+        G_tr = training_graphs_nx[idx]
+        sim = wl_similarity_degree_only(generated_G, G_tr)
+        if sim > best_sim:
+            best_sim = sim
+            best_G = G_tr
+    if best_G is None:
+        # fallback: compute against first element
+        best_G = training_graphs_nx[0]
+        best_sim = wl_similarity_degree_only(generated_G, best_G)
+    return best_G, best_sim
 
 
 def load_dataset(n_nodes):
@@ -175,7 +260,11 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
     # Generate and evaluate
     print(f"\n--- Generating & Evaluating ---")
     generalization_scores = []  # Gen1 vs Gen2
-    memorization_scores = []    # Gen1 vs S1 training
+    # Robust memorization across all generated samples (symmetric): Gen1↔S1 and Gen2↔S2
+    memorization_scores_gen1 = []    # Gen1 vs closest S1 training
+    memorization_scores_gen2 = []    # Gen2 vs closest S2 training
+    empty_gen1_count = 0
+    empty_gen2_count = 0
     
     # Precompute S1 training graphs for memorization check
     S1_training_graphs_nx = []
@@ -197,6 +286,26 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
     
     print(f"Constructed {len(S1_training_graphs_nx)} training graphs for memorization check")
     print(f"Sample training graph: {S1_training_graphs_nx[0].number_of_nodes()} nodes, {S1_training_graphs_nx[0].number_of_edges()} edges")
+    
+    # Precompute S2 training graphs for closest-match visualization (mirror of S1)
+    S2_training_graphs_nx = []
+    for data in S2:
+        if hasattr(data, 'A') and data.A is not None:
+            adj = data.A[0].cpu().numpy()
+        else:
+            n_nodes = data.num_nodes
+            adj = np.zeros((n_nodes, n_nodes))
+            if data.edge_index.numel() > 0:
+                edge_index = data.edge_index.cpu().numpy()
+                adj[edge_index[0], edge_index[1]] = 1.0
+        features = data.x.detach().cpu().numpy() if hasattr(data, 'x') else None
+        G_train = construct_nx_from_adj(adj, node_features=features)
+        S2_training_graphs_nx.append(G_train)
+
+    # Precompute degree histograms for kNN prefilter
+    n_bins = n_nodes  # degrees in [0, n-1]
+    S1_degree_hists = _precompute_degree_hists(S1_training_graphs_nx, n_bins)
+    S2_degree_hists = _precompute_degree_hists(S2_training_graphs_nx, n_bins)
     
     for i, test_graph in enumerate(tqdm(test_graphs, desc=f"Testing (n={n_nodes}, N={N})")):
         # Get conditioning stats
@@ -220,16 +329,32 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
         
         # Compute generalization (Gen1 vs Gen2)
         for sample_idx in range(NUM_SAMPLES_PER_CONDITION):
-            sim = compute_wl_similarity(G1_samples[sample_idx], G2_samples[sample_idx])
+            g1 = G1_samples[sample_idx]
+            g2 = G2_samples[sample_idx]
+            
+            # Track empty graphs
+            if g1.number_of_nodes() == 0:
+                empty_gen1_count += 1
+            if g2.number_of_nodes() == 0:
+                empty_gen2_count += 1
+            
+            # Degree-only WL similarity between Gen1 and Gen2 samples
+            sim = wl_similarity_degree_only(g1, g2)
             generalization_scores.append(sim)
             
             # Debug first few
             if i == 0 and sample_idx < 2:
                 print(f"  Gen1 vs Gen2 sample {sample_idx}: WL similarity = {sim:.4f}")
         
-        # Compute memorization (Gen1 vs closest S1 training graph)
-        closest_G, sim = find_closest_graph_in_training(G1_samples[0], S1_training_graphs_nx)
-        memorization_scores.append(sim)
+        # Robust memorization with k-NN prefilter on degree histograms
+        # Gen1 vs S1
+        for g in G1_samples:
+            _, sim_g1 = find_closest_graph_in_training_degree_only_k(g, S1_training_graphs_nx, S1_degree_hists, n_bins, K_NEAREST)
+            memorization_scores_gen1.append(sim_g1)
+        # Gen2 vs S2 (symmetric)
+        for g in G2_samples:
+            _, sim_g2 = find_closest_graph_in_training_degree_only_k(g, S2_training_graphs_nx, S2_degree_hists, n_bins, K_NEAREST)
+            memorization_scores_gen2.append(sim_g2)
         
         # Debug: Print first few to check
         if i < 2:
@@ -240,25 +365,35 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
             if G1_samples[0].number_of_nodes() > 0:
                 first_node = list(G1_samples[0].nodes())[0]
                 gen_has_feat = 'feature_vector' in G1_samples[0].nodes[first_node]
-            
-            if closest_G.number_of_nodes() > 0:
-                first_node = list(closest_G.nodes())[0]
-                train_has_feat = 'feature_vector' in closest_G.nodes[first_node]
-            
-            print(f"  Test {i}: Generated graph ({G1_samples[0].number_of_nodes()}n, {G1_samples[0].number_of_edges()}e, has_feat={gen_has_feat}) "
-                  f"vs closest training ({closest_G.number_of_nodes()}n, {closest_G.number_of_edges()}e, has_feat={train_has_feat}), sim={sim:.4f}")
-            
-            # Manual test of WL similarity
-            if i == 0:
-                test_sim = compute_wl_similarity(G1_samples[0], S1_training_graphs_nx[0])
-                print(f"  Direct WL test (Gen1 vs first training): {test_sim:.4f}")
+            # Print a quick nearest-neighbor sim snapshot for context
+            dbg_closest, dbg_sim = find_closest_graph_in_training_degree_only_k(G1_samples[0], S1_training_graphs_nx, S1_degree_hists, n_bins, min(10, K_NEAREST))
+            if dbg_closest is not None:
+                print(f"  Test {i}: Gen1 sample0 ({G1_samples[0].number_of_nodes()}n, {G1_samples[0].number_of_edges()}e, has_feat={gen_has_feat}) "
+                      f"vs closest S1 (deg-only WL), sim={dbg_sim:.4f}")
+            # Manual degree-only WL test between first gen and first train
+            if i == 0 and len(S1_training_graphs_nx) > 0:
+                test_sim = wl_similarity_degree_only(G1_samples[0], S1_training_graphs_nx[0])
+                print(f"  Direct WL test (degree-only) Gen1 vs first S1: {test_sim:.4f}")
     
     gen_mean = np.mean(generalization_scores) if len(generalization_scores) > 0 else np.nan
+    # Combine symmetric memorization scores for reporting/plots
+    memorization_scores = memorization_scores_gen1 + memorization_scores_gen2
     mem_mean = np.mean(memorization_scores) if len(memorization_scores) > 0 else np.nan
+    
+    # Calculate empty graph statistics
+    total_gen1_graphs = len(test_graphs) * NUM_SAMPLES_PER_CONDITION
+    total_gen2_graphs = len(test_graphs) * NUM_SAMPLES_PER_CONDITION
+    empty_gen1_pct = 100 * empty_gen1_count / total_gen1_graphs if total_gen1_graphs > 0 else 0
+    empty_gen2_pct = 100 * empty_gen2_count / total_gen2_graphs if total_gen2_graphs > 0 else 0
     
     print(f"\nResults:")
     print(f"  Generalization (Gen1 vs Gen2): {gen_mean:.4f} ± {np.std(generalization_scores):.4f}")
-    print(f"  Memorization (Gen1 vs S1):     {mem_mean:.4f} ± {np.std(memorization_scores):.4f}")
+    print(f"  Memorization (symmetric):      {mem_mean:.4f} ± {np.std(memorization_scores):.4f}")
+    print(f"\n  [WARNING] Empty Graph Statistics:")
+    print(f"    Gen1 empty: {empty_gen1_count}/{total_gen1_graphs} ({empty_gen1_pct:.1f}%)")
+    print(f"    Gen2 empty: {empty_gen2_count}/{total_gen2_graphs} ({empty_gen2_pct:.1f}%)")
+    if empty_gen1_pct > 10 or empty_gen2_pct > 10:
+        print(f"    ⚠️  HIGH EMPTY RATE! Generated graphs are mostly empty - decoder not working properly!")
     
     # Save example graphs for visualization (first test case)
     print(f"\n--- Generating example graphs for visualization ---")
@@ -269,22 +404,33 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
     torch.manual_seed(999)  # Same seed
     example_gen2, _, _ = generate_graphs(autoencoder_gen2, denoise_gen2, example_conditioning, betas, num_samples=3)
     
-    # Get example training graphs from S1 and S2
-    example_s1 = [S1_training_graphs_nx[i] for i in [0, 10, 20]]
-    example_s2_graphs = []
-    for data in [S2[0], S2[10], S2[20]]:
-        # Create adjacency matrix from edge_index if A doesn't exist
-        if hasattr(data, 'A') and data.A is not None:
-            adj = data.A[0].cpu().numpy()
-        else:
-            n_nodes = data.num_nodes
-            adj = np.zeros((n_nodes, n_nodes))
-            if data.edge_index.numel() > 0:
-                edge_index = data.edge_index.cpu().numpy()
-                adj[edge_index[0], edge_index[1]] = 1.0
-        
-        features = data.x.detach().cpu().numpy() if hasattr(data, 'x') else None
-        example_s2_graphs.append(construct_nx_from_adj(adj, node_features=features))
+    # Find closest training matches for the example generated graphs
+    closest_s1_for_gen1 = []
+    closest_s1_sims = []
+    for G in example_gen1:
+        G_closest, sim = find_closest_graph_in_training_degree_only_k(G, S1_training_graphs_nx, S1_degree_hists, n_bins, K_NEAREST)
+        closest_s1_for_gen1.append(G_closest)
+        closest_s1_sims.append(sim)
+    
+    closest_s2_for_gen2 = []
+    closest_s2_sims = []
+    for G in example_gen2:
+        G_closest, sim = find_closest_graph_in_training_degree_only_k(G, S2_training_graphs_nx, S2_degree_hists, n_bins, K_NEAREST)
+        closest_s2_for_gen2.append(G_closest)
+        closest_s2_sims.append(sim)
+    
+    # Example subsets from training (fallback/reference)
+    # Fallback example slices (safe indexing)
+    if len(S1_training_graphs_nx) > 0:
+        idxs_s1 = [0, min(10, len(S1_training_graphs_nx)-1), min(20, len(S1_training_graphs_nx)-1)]
+        example_s1 = [S1_training_graphs_nx[i] for i in idxs_s1]
+    else:
+        example_s1 = []
+    if len(S2_training_graphs_nx) > 0:
+        idxs_s2 = [0, min(10, len(S2_training_graphs_nx)-1), min(20, len(S2_training_graphs_nx)-1)]
+        example_s2_graphs = [S2_training_graphs_nx[i] for i in idxs_s2]
+    else:
+        example_s2_graphs = []
     
     return {
         'n_nodes': n_nodes,
@@ -296,12 +442,19 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
         'dn_gen1_metrics': dn_gen1_metrics,
         'dn_gen2_metrics': dn_gen2_metrics,
         'generalization_scores': generalization_scores,
-        'memorization_scores': memorization_scores,
+    # Distributions for plots and logs
+    'memorization_scores': memorization_scores,
+    'memorization_scores_gen1': memorization_scores_gen1,
+    'memorization_scores_gen2': memorization_scores_gen2,
         'distribution_summary': distribution_summary,
         'example_gen1': example_gen1,
         'example_gen2': example_gen2,
         'example_s1': example_s1,
         'example_s2': example_s2_graphs,
+        'closest_s1_for_gen1': closest_s1_for_gen1,
+        'closest_s2_for_gen2': closest_s2_for_gen2,
+        'closest_s1_sims': closest_s1_sims,
+        'closest_s2_sims': closest_s2_sims,
     }
 
 
@@ -314,14 +467,14 @@ def visualize_example_graphs_single(result, n_nodes, output_dir):
     fig_dir = output_dir / "figures"
     fig_dir.mkdir(exist_ok=True)
     
-    # Create 4x3 grid: 4 sources (Gen1, Gen2, S1, S2) x 3 examples each
+    # Create 4x3 grid: 4 sources (Gen1, Closest S1, Gen2, Closest S2) x 3 examples each
     fig, axes = plt.subplots(4, 3, figsize=(15, 18))
     
     sources = [
         ('Gen1', result['example_gen1'], '#3498db'),  # Blue
+        ('Closest S1 to Gen1', result.get('closest_s1_for_gen1', result['example_s1']), '#2ecc71'),  # Green
         ('Gen2', result['example_gen2'], '#e74c3c'),  # Red
-        ('S1 (Training)', result['example_s1'], '#2ecc71'),  # Green
-        ('S2 (Training)', result['example_s2'], '#f39c12'),  # Orange
+        ('Closest S2 to Gen2', result.get('closest_s2_for_gen2', result['example_s2']), '#f39c12'),  # Orange
     ]
     
     for row_idx, (label, graphs, color) in enumerate(sources):
@@ -360,11 +513,11 @@ def visualize_example_graphs_single(result, n_nodes, output_dir):
             if row_idx == 0:
                 ax.set_title(f'Example {col_idx+1}', fontsize=12, fontweight='bold')
     
-    plt.suptitle(f'Graph Examples: n={n_nodes} nodes (N={FIXED_N} training)', 
+    plt.suptitle(f'Generated vs Closest Training Matches: n={n_nodes} nodes (N={FIXED_N} training)', 
                 fontsize=18, fontweight='bold', y=0.995)
     plt.tight_layout(rect=[0.05, 0, 1, 0.99])
-    plt.savefig(fig_dir / f'example_graphs_n{n_nodes}.png', dpi=300, bbox_inches='tight')
-    print(f"  Saved: {fig_dir / f'example_graphs_n{n_nodes}.png'}")
+    plt.savefig(fig_dir / f'gen_vs_closest_train_n{n_nodes}.png', dpi=300, bbox_inches='tight')
+    print(f"  Saved: {fig_dir / f'gen_vs_closest_train_n{n_nodes}.png'}")
     plt.close()
 
 
@@ -384,14 +537,14 @@ def visualize_example_graphs(all_results, output_dir):
         
         result = all_results[n_nodes]
         
-        # Create 4x3 grid: 4 sources (Gen1, Gen2, S1, S2) x 3 examples each
+        # Create 4x3 grid: 4 sources (Gen1, Closest S1, Gen2, Closest S2) x 3 examples each
         fig, axes = plt.subplots(4, 3, figsize=(15, 18))
         
         sources = [
             ('Gen1', result['example_gen1'], '#3498db'),  # Blue
+            ('Closest S1 to Gen1', result.get('closest_s1_for_gen1', result['example_s1']), '#2ecc71'),  # Green
             ('Gen2', result['example_gen2'], '#e74c3c'),  # Red
-            ('S1 (Training)', result['example_s1'], '#2ecc71'),  # Green
-            ('S2 (Training)', result['example_s2'], '#f39c12'),  # Orange
+            ('Closest S2 to Gen2', result.get('closest_s2_for_gen2', result['example_s2']), '#f39c12'),  # Orange
         ]
         
         for row_idx, (label, graphs, color) in enumerate(sources):
@@ -430,12 +583,12 @@ def visualize_example_graphs(all_results, output_dir):
                 if row_idx == 0:
                     ax.set_title(f'Example {col_idx+1}', fontsize=12, fontweight='bold')
         
-        plt.suptitle(f'Graph Examples: n={n_nodes} nodes (N={FIXED_N} training)', 
-                    fontsize=18, fontweight='bold', y=0.995)
-        plt.tight_layout(rect=[0.05, 0, 1, 0.99])
-        plt.savefig(fig_dir / f'example_graphs_n{n_nodes}.png', dpi=300, bbox_inches='tight')
-        print(f"Saved: {fig_dir / f'example_graphs_n{n_nodes}.png'}")
-        plt.close()
+    plt.suptitle(f'Generated vs Closest Training Matches: n={n_nodes} nodes (N={FIXED_N} training)', 
+                 fontsize=18, fontweight='bold', y=0.995)
+    plt.tight_layout(rect=[0.05, 0, 1, 0.99])
+    plt.savefig(fig_dir / f'gen_vs_closest_train_n{n_nodes}.png', dpi=300, bbox_inches='tight')
+    print(f"Saved: {fig_dir / f'gen_vs_closest_train_n{n_nodes}.png'}")
+    plt.close()
 
 
 def visualize_gt_vs_generated_single(result, n_nodes, output_dir):
@@ -633,7 +786,7 @@ def create_aggregate_visualizations(all_results, output_dir):
             mem_stds.append(np.std(mem_scores))
             complexity_ratios.append(result['complexity_ratio'])
     
-    # 1. Main histogram plot: Memorization to Generalization as n increases
+    # 1. Main histogram plot: Memorization to Generalization as n increases (histograms, no KDE)
     n_plots = len(n_vals)
     fig, axes = plt.subplots(1, n_plots, figsize=(5*n_plots, 5))
     if n_plots == 1:
@@ -646,23 +799,12 @@ def create_aggregate_visualizations(all_results, output_dir):
         gen_scores = result['generalization_scores']
         mem_scores = result['memorization_scores']
         
-        # Use kernel density estimation for smoother visualization
-        from scipy.stats import gaussian_kde
-        
-        # Create KDE for both distributions
-        x_range = np.linspace(0, 1, 200)
-        
-        if len(mem_scores) > 1:
-            kde_mem = gaussian_kde(mem_scores, bw_method=0.1)
-            density_mem = kde_mem(x_range)
-            ax.fill_between(x_range, density_mem, alpha=0.5, color='orange', label='Memorization')
-            ax.plot(x_range, density_mem, color='darkorange', linewidth=2)
-        
-        if len(gen_scores) > 1:
-            kde_gen = gaussian_kde(gen_scores, bw_method=0.1)
-            density_gen = kde_gen(x_range)
-            ax.fill_between(x_range, density_gen, alpha=0.5, color='blue', label='Generalization')
-            ax.plot(x_range, density_gen, color='darkblue', linewidth=2)
+        # Plot overlapping histograms (normalized) instead of KDE
+        bins = np.linspace(0, 1, 21)
+        if len(mem_scores) > 0:
+            ax.hist(mem_scores, bins=bins, alpha=0.5, color='orange', label='Memorization', density=True, edgecolor='black')
+        if len(gen_scores) > 0:
+            ax.hist(gen_scores, bins=bins, alpha=0.5, color='blue', label='Generalization', density=True, edgecolor='black')
         
         # Add mean lines
         gen_mean = np.mean(gen_scores)
@@ -678,16 +820,13 @@ def create_aggregate_visualizations(all_results, output_dir):
                 ha='center', fontsize=12, color='darkorange', fontweight='bold',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
-        ax.set_xlabel('WL Similarity', fontsize=16)
-        ax.set_ylabel('Density', fontsize=16)
-        ax.set_title(f'n={n_nodes}', fontsize=18, fontweight='bold')
+        ax.set_xlabel('WL Similarity', fontsize=25)
+        ax.set_ylabel('Density', fontsize=25)
         ax.set_xlim(0, 1)
         ax.tick_params(axis='both', labelsize=14)
         if idx == 0:
             ax.legend(fontsize=12, loc='upper left')
-    
-    fig.suptitle(f'Memorization to Generalization: Increasing Graph Complexity (N={FIXED_N} fixed)', 
-                 fontsize=20, y=1.02)
+
     plt.tight_layout()
     plt.savefig(fig_dir / 'memorization_to_generalization_histograms.png', dpi=300, bbox_inches='tight')
     print(f"Saved: {fig_dir / 'memorization_to_generalization_histograms.png'}")
@@ -801,7 +940,46 @@ def main():
                        help='Output directory')
     parser.add_argument('--run-name', type=str, default=None,
                        help='Custom run name')
+    parser.add_argument('--fast', action='store_true',
+                       help='Fast mode: fewer epochs/timesteps and samples for a quick smoke test')
+    parser.add_argument('--fixed-n', type=int, default=None,
+                       help='Override FIXED_N training set size')
+    parser.add_argument('--epochs-ae', type=int, default=None,
+                       help='Override autoencoder epochs')
+    parser.add_argument('--epochs-dn', type=int, default=None,
+                       help='Override denoiser epochs')
+    parser.add_argument('--timesteps', type=int, default=None,
+                       help='Override diffusion timesteps')
+    parser.add_argument('--node-sizes', type=str, default=None,
+                       help='Comma-separated list of node sizes to run (e.g., "10,30,50")')
+    parser.add_argument('--k-nearest', type=int, default=100,
+                       help='Use k-nearest shortlist for training matching (degree-hist prefilter)')
     args = parser.parse_args()
+
+    # Optionally override module-level settings for quick experimentation
+    global FIXED_N, NODE_SIZES, EPOCHS_AUTOENCODER, EPOCHS_DENOISER, TIMESTEPS, NUM_SAMPLES_PER_CONDITION, K_NEAREST
+    if args.fixed_n is not None:
+        FIXED_N = args.fixed_n
+    if args.node_sizes is not None:
+        try:
+            NODE_SIZES = [int(x) for x in args.node_sizes.split(',') if x.strip()]
+        except Exception:
+            print(f"Warning: failed to parse --node-sizes='{args.node_sizes}', using default {NODE_SIZES}")
+    if args.epochs_ae is not None:
+        EPOCHS_AUTOENCODER = args.epochs_ae
+    if args.epochs_dn is not None:
+        EPOCHS_DENOISER = args.epochs_dn
+    if args.timesteps is not None:
+        TIMESTEPS = args.timesteps
+    if args.fast:
+        # Conservative fast-mode defaults for a quick smoke test
+        EPOCHS_AUTOENCODER = min(EPOCHS_AUTOENCODER, 5)
+        EPOCHS_DENOISER = min(EPOCHS_DENOISER, 5)
+        TIMESTEPS = min(TIMESTEPS, 100)
+        NUM_SAMPLES_PER_CONDITION = min(NUM_SAMPLES_PER_CONDITION, 2)
+        K_NEAREST = min(K_NEAREST, 50)
+    if args.k_nearest is not None and args.k_nearest > 0:
+        K_NEAREST = args.k_nearest
     
     # Create output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -813,6 +991,11 @@ def main():
     output_dir = Path(args.output_dir) / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Initialize incremental metrics progress log
+    progress_path = output_dir / "metrics_progress.txt"
+    with open(progress_path, 'w') as pf:
+        pf.write("n_nodes\tGen_WL_Mean\tGen_WL_Std\tMem_WL_Mean\tMem_WL_Std\n")
+    
     print(f"\n{'='*80}")
     print("Graph Complexity Study: Memorization to Generalization")
     print(f"{'='*80}")
@@ -820,6 +1003,9 @@ def main():
     print(f"Device: {device}")
     print(f"Fixed training size: N = {FIXED_N}")
     print(f"Node sizes: {NODE_SIZES}")
+    if args.fast:
+        print(f"Fast mode: AE epochs={EPOCHS_AUTOENCODER}, DN epochs={EPOCHS_DENOISER}, timesteps={TIMESTEPS}, samples/cond={NUM_SAMPLES_PER_CONDITION}")
+    print(f"k-nearest shortlist size: K={K_NEAREST}")
     print(f"{'='*80}\n")
     
     # Run experiments for each node size
@@ -858,6 +1044,14 @@ def main():
         with open(n_output_dir / f'results_n{n_nodes}.pkl', 'wb') as f:
             pickle.dump(result, f)
         
+        # Append WL metrics for this n to progress log for early inspection
+        gen_mean = float(np.mean(result['generalization_scores'])) if len(result['generalization_scores']) > 0 else float('nan')
+        gen_std = float(np.std(result['generalization_scores'])) if len(result['generalization_scores']) > 0 else float('nan')
+        mem_mean = float(np.mean(result['memorization_scores'])) if len(result['memorization_scores']) > 0 else float('nan')
+        mem_std = float(np.std(result['memorization_scores'])) if len(result['memorization_scores']) > 0 else float('nan')
+        with open(progress_path, 'a') as pf:
+            pf.write(f"{n_nodes}\t{gen_mean:.4f}\t{gen_std:.4f}\t{mem_mean:.4f}\t{mem_std:.4f}\n")
+        
         # Create immediate visualization for this n (don't wait till end)
         print(f"\n--- Creating immediate visualizations for n={n_nodes} ---")
         visualize_gt_vs_generated_single(result, n_nodes, output_dir)
@@ -876,12 +1070,12 @@ def main():
     print(f"{'='*80}")
     print(f"\nResults saved to: {output_dir}")
     print(f"\nKey outputs:")
-    print(f"  - Main histogram (KDE): {output_dir}/figures/memorization_to_generalization_histograms.png")
+    print(f"  - Main histogram (Mem vs Gen): {output_dir}/figures/memorization_to_generalization_histograms.png")
     print(f"  - Mem vs Gen difference: {output_dir}/figures/memorization_vs_generalization_difference.png")
     print(f"  - WL similarity vs n: {output_dir}/figures/wl_similarity_vs_complexity.png")
     print(f"  - Complexity ratio: {output_dir}/figures/complexity_ratio_vs_n.png")
     print(f"  - GT vs Generated: {output_dir}/figures/gt_vs_generated_n*.png (for each n)")
-    print(f"  - Example 4-source: {output_dir}/figures/example_graphs_n*.png (for each n)")
+    print(f"  - Gen vs Closest Train: {output_dir}/figures/gen_vs_closest_train_n*.png (for each n)")
     print(f"\nInterpretation:")
     print(f"  - As n increases (left to right in histogram), observe transition")
     print(f"  - Small n: Task is easy → both Mem and Gen high (model learns quickly)")

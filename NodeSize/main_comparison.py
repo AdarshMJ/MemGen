@@ -914,7 +914,8 @@ def generate_graphs(autoencoder, denoise_model, conditioning_stats, betas, num_s
             batch_size=num_samples
         )
         x_sample = samples[-1]
-        adj = autoencoder.decode_mu(x_sample)
+        # Use soft sampling during generation to get probabilities (not hard-thresholded yet)
+        adj = autoencoder.decode_mu(x_sample, use_soft_sampling=True)
 
         graphs = []
         adj_matrices = []
@@ -923,6 +924,70 @@ def generate_graphs(autoencoder, denoise_model, conditioning_stats, betas, num_s
         # Extract target graph sizes from conditioning stats
         # First element of stats is num_nodes
         target_sizes = cond_tensor[:, 0].cpu().numpy().astype(int)
+        # Extract optional target edges/density if available
+        has_edges = cond_tensor.size(1) > 1
+        has_density = cond_tensor.size(1) > 2
+        target_edges_arr = None
+        if has_edges:
+            # Guard against NaNs/negatives
+            edges_raw = cond_tensor[:, 1].detach().cpu()
+            edges_raw = torch.nan_to_num(edges_raw, nan=0.0)
+            target_edges_arr = edges_raw.clamp(min=0).long().numpy()
+        
+        # We'll adaptively select edges in the n×n region to match target edge count (if available)
+        for idx in range(adj.shape[0]):
+            n = int(target_sizes[idx] if idx < len(target_sizes) else target_sizes[0])
+            n = max(0, min(n, adj.shape[1]))
+            if n <= 1:
+                # Zero out and skip
+                adj[idx] = 0
+                continue
+            # Mask out padding region outside n×n
+            adj[idx, n:, :] = 0
+            adj[idx, :, n:] = 0
+            # Work on probabilities in the target region
+            sub = adj[idx, :n, :n]
+            # Use only upper triangle without diagonal
+            tri = torch.triu_indices(n, n, offset=1, device=sub.device)
+            vals = sub[tri[0], tri[1]]
+            # Determine target edge count
+            if target_edges_arr is not None:
+                tgt_e = int(target_edges_arr[idx] if idx < len(target_edges_arr) else target_edges_arr[0])
+            elif has_density:
+                density = float(torch.nan_to_num(cond_tensor[idx, 2], nan=0.0).item())
+                max_edges = n * (n - 1) // 2
+                tgt_e = int(max(0, min(max_edges, round(density * max_edges))))
+            else:
+                # Fallback: small positive ratio of possible edges
+                max_edges = n * (n - 1) // 2
+                tgt_e = max(1, int(0.02 * max_edges))
+            max_edges = n * (n - 1) // 2
+            tgt_e = max(0, min(tgt_e, max_edges))
+            # If probabilities are all zero, create a minimal connected structure as fallback
+            if torch.all(vals <= 0):
+                # Build a simple chain to avoid empty graph
+                sub_bin = torch.zeros_like(sub)
+                for u in range(n - 1):
+                    sub_bin[u, u + 1] = 1.0
+                    sub_bin[u + 1, u] = 1.0
+                # If chain has more edges than target, it's fine for now; we'll keep minimal structure
+                adj[idx, :n, :n] = sub_bin
+                continue
+            # Select top-k edges according to probabilities
+            k = tgt_e
+            if k <= 0:
+                adj[idx, :n, :n] = 0
+                continue
+            k = int(min(k, vals.numel()))
+            topk = torch.topk(vals, k=k, largest=True, sorted=False)
+            chosen = torch.zeros_like(vals)
+            chosen[topk.indices] = 1.0
+            # Scatter back into a binary adjacency
+            sub_bin = torch.zeros_like(sub)
+            sub_bin[tri[0], tri[1]] = chosen
+            sub_bin = sub_bin + sub_bin.transpose(0, 1)
+            # Assign back
+            adj[idx, :n, :n] = sub_bin
         
         for idx in range(num_samples):
             adj_np = adj[idx].detach().cpu().numpy()
@@ -932,15 +997,34 @@ def generate_graphs(autoencoder, denoise_model, conditioning_stats, betas, num_s
             n_target = target_sizes[idx] if idx < len(target_sizes) else target_sizes[0]
             n_target = min(n_target, adj_np.shape[0])  # Safety check
             
-            # Debug: Print info for first generation
-            if idx == 0 and len(graphs) == 0:
-                print(f"  [Generation Debug] Decoder output shape: {adj_np.shape}, "
-                      f"Target size: {n_target}, "
-                      f"Edges before trim: {(adj_np > 0.5).sum()}, "
-                      f"Edges after trim: {(adj_np[:n_target, :n_target] > 0.5).sum()}")
-            
             # Extract submatrix
             adj_np_trimmed = adj_np[:n_target, :n_target]
+            
+            # Debug: Print detailed info for first generation
+            if idx == 0 and len(graphs) == 0:
+                edges_full = int((adj_np > 0.5).sum())
+                edges_trimmed = int((adj_np_trimmed > 0.5).sum())
+                
+                # Check where edges are located in the full matrix
+                edges_in_target_region = int((adj_np[:n_target, :n_target] > 0.5).sum())
+                edges_outside_target = edges_full - edges_in_target_region
+                
+                # print(f"  [Generation Debug] Decoder output shape: {adj_np.shape}, Target size: {n_target}")
+                # print(f"    Full matrix: {edges_full} edges")
+                # print(f"    Target region [0:{n_target}, 0:{n_target}]: {edges_in_target_region} edges")
+                # print(f"    Outside target region: {edges_outside_target} edges")
+                # print(f"    Value range: [{adj_np.min():.4f}, {adj_np.max():.4f}]")
+                # print(f"    Unique values: {np.unique(adj_np)[:10]}")  # Show first 10 unique values
+                
+                if edges_trimmed == 0:
+                    print(f"    [WARNING] Generated graph is EMPTY!")
+                    # Check if it's truly all zeros or just below threshold
+                    max_val_in_target = adj_np[:n_target, :n_target].max()
+                    print(f"    Max value in target region: {max_val_in_target:.6f}")
+                    if max_val_in_target == 0:
+                        print(f"    → Decoder output is completely zero in target region!")
+                    else:
+                        print(f"    → Decoder has non-zero values but all below 0.5 threshold")
             
             graphs.append(construct_nx_from_adj(adj_np_trimmed))
             adj_matrices.append(adj_np_trimmed)
@@ -958,11 +1042,12 @@ def compute_wl_similarity(G1, G2):
     with a coarse discretization of the first few feature dimensions so the WL
     kernel is sensitive to feature homophily as well.
     """
-    # Handle empty graphs (can happen with small training sets)
+    # Handle empty graphs (can happen with generation failures)
     if G1.number_of_nodes() == 0 or G2.number_of_nodes() == 0:
-        # Both empty: identical
+        # Both empty: This should NOT be treated as perfect similarity!
+        # Empty graphs indicate generation failure, not actual similarity
         if G1.number_of_nodes() == 0 and G2.number_of_nodes() == 0:
-            return 1.0
+            return 0.0  # Changed from 1.0 - empty graphs are invalid, not identical
         # One empty, one not: completely different
         else:
             return 0.0

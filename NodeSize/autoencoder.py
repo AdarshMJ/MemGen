@@ -14,27 +14,42 @@ class Decoder(nn.Module):
         super(Decoder, self).__init__()
         self.n_layers = n_layers
         self.n_nodes = n_nodes
+        self.n_edges_ut = n_nodes * (n_nodes - 1) // 2  # upper-triangular (no diag)
 
         mlp_layers = [nn.Linear(latent_dim, hidden_dim)] + [nn.Linear(hidden_dim, hidden_dim) for i in range(n_layers-2)]
-        mlp_layers.append(nn.Linear(hidden_dim, 2*n_nodes*(n_nodes-1)//2))
+        # Single logit per upper-tri edge
+        mlp_layers.append(nn.Linear(hidden_dim, self.n_edges_ut))
 
         self.mlp = nn.ModuleList(mlp_layers)
         self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):
+    def forward(self, x, return_logits: bool = False, use_soft_sampling: bool = False):
+        # return_logits=True: return full symmetric logits adjacency
+        # use_soft_sampling=True: return probabilities via sigmoid (for generation)
         for i in range(self.n_layers-1):
             x = self.relu(self.mlp[i](x))
-        
-        x = self.mlp[self.n_layers-1](x)
-        x = torch.reshape(x, (x.size(0), -1, 2))
-        x = F.gumbel_softmax(x, tau=1, hard=True)[:,:,0]
 
-        adj = torch.zeros(x.size(0), self.n_nodes, self.n_nodes, device=x.device)
+        edge_ut_logits = self.mlp[self.n_layers-1](x)  # (B, n_edges_ut)
+
+        # Build full symmetric matrix of logits
+        B = edge_ut_logits.size(0)
+        adj_logits = torch.zeros(B, self.n_nodes, self.n_nodes, device=edge_ut_logits.device)
         idx = torch.triu_indices(self.n_nodes, self.n_nodes, 1)
-        adj[:,idx[0],idx[1]] = x
-        adj = adj + torch.transpose(adj, 1, 2)
-        return adj
+        adj_logits[:, idx[0], idx[1]] = edge_ut_logits
+        adj_logits = adj_logits + adj_logits.transpose(1, 2)
+        # Strongly mask diagonal to avoid self-loops
+        diag_mask = torch.eye(self.n_nodes, device=adj_logits.device).unsqueeze(0)
+        adj_logits = adj_logits.masked_fill(diag_mask.bool(), -10.0)
+
+        if return_logits:
+            return adj_logits
+
+        if use_soft_sampling:
+            # Return probabilities for generation
+            return torch.sigmoid(adj_logits)
+
+        # Default: return hard thresholded adjacency (not used for loss)
+        return (torch.sigmoid(adj_logits) > 0.5).float()
 
 
 class MultiHeadDecoder(nn.Module):
@@ -475,8 +490,9 @@ class VariationalAutoEncoder(nn.Module):
         mu = self.fc_mu(x_g)
         logvar = self.fc_logvar(x_g)
         x_g = self.reparameterize(mu, logvar)
-        adj = self.decoder(x_g)
-        return adj
+        # Return probabilities for inspection/reconstruction metrics
+        adj_prob = self.decoder(x_g, use_soft_sampling=True)
+        return adj_prob
 
     def encode(self, data):
         x_g = self.encoder(data)
@@ -494,26 +510,51 @@ class VariationalAutoEncoder(nn.Module):
             return mu
 
     def decode(self, mu, logvar):
-       x_g = self.reparameterize(mu, logvar)
-       adj = self.decoder(x_g)
-       return adj
+        x_g = self.reparameterize(mu, logvar)
+        adj_prob = self.decoder(x_g, use_soft_sampling=True)
+        return adj_prob
 
-    def decode_mu(self, mu):
-       adj = self.decoder(mu)
-       return adj
+    def decode_mu(self, mu, use_soft_sampling=False):
+        if use_soft_sampling:
+            return self.decoder(mu, use_soft_sampling=True)
+        # By default, return probabilities (safer for downstream calibration)
+        return self.decoder(mu, use_soft_sampling=True)
 
     def loss_function(self, data, beta=0.05):
+        # Encode
         x_g  = self.encoder(data)
         mu = self.fc_mu(x_g)
         logvar = self.fc_logvar(x_g)
-        x_g = self.reparameterize(mu, logvar) # concat or sum fully connected layer apo ta feats tou graph
-        adj = self.decoder(x_g)
-        
-        #A = data.A[:,:,:,0]
-        recon = F.l1_loss(adj, data.A, reduction='sum')
-        kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        loss = recon + beta*kld
+        z = self.reparameterize(mu, logvar)
+        # Decoder logits
+        adj_logits = self.decoder(z, return_logits=True)  # (B, n_max, n_max)
+        target = data.A.float()
 
+        # Per-graph mask for valid n×n region (exclude padding and diagonal)
+        if hasattr(data, 'stats') and data.stats is not None:
+            ns = data.stats[:, 0].long().clamp(min=0, max=self.n_max_nodes)
+        else:
+            ns = torch.full((adj_logits.size(0),), self.n_max_nodes, dtype=torch.long, device=adj_logits.device)
+        B, n_max, _ = adj_logits.shape
+        idx = torch.arange(n_max, device=adj_logits.device)
+        in_row = idx.unsqueeze(0) < ns.unsqueeze(1)
+        mask = (in_row.unsqueeze(2) & in_row.unsqueeze(1)).float()
+        diag = torch.eye(n_max, device=adj_logits.device).unsqueeze(0)
+        mask = mask * (1.0 - diag)
+
+        # Compute class imbalance weight on the masked region
+        with torch.no_grad():
+            pos = (target * mask).sum()
+            neg = (mask.sum() - pos).clamp(min=1.0)
+            pos_weight = (neg / (pos.clamp(min=1.0))).detach()
+
+        # BCE with logits on masked entries
+        bce = F.binary_cross_entropy_with_logits(adj_logits, target, pos_weight=pos_weight, reduction='none')
+        recon = (bce * mask).sum()
+
+        # KL term
+        kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        loss = recon + beta * kld
         return loss, recon, kld
 
 

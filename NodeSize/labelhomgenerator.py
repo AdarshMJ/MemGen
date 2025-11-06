@@ -25,7 +25,8 @@ def make_symmetric(A):
 
 
 def generate_label_homophilic_graph(num_nodes, num_classes, avg_degree, 
-                                    label_homophily, seed=None, n_max_nodes=100):
+                                    label_homophily, seed=None, n_max_nodes=100,
+                                    class_probs=None, rewiring_rate=0.0):
     """
     Generate a random graph with controlled label homophily.
     
@@ -55,8 +56,14 @@ def generate_label_homophilic_graph(num_nodes, num_classes, avg_degree,
         np.random.seed(seed)
         torch.manual_seed(seed)
     
-    # Generate random node labels
-    labels = torch.randint(0, num_classes, (num_nodes,))
+    # Generate random node labels (optionally with non-uniform class proportions)
+    if class_probs is None:
+        labels = torch.randint(0, num_classes, (num_nodes,))
+    else:
+        probs = np.asarray(class_probs, dtype=np.float64)
+        probs = probs / probs.sum()
+        labels_np = np.random.choice(np.arange(num_classes), size=num_nodes, p=probs)
+        labels = torch.from_numpy(labels_np).long()
     
     # One-hot encoding for label-based connection probabilities
     Z = F.one_hot(labels, num_classes=num_classes).float()
@@ -149,6 +156,23 @@ def generate_label_homophilic_graph(num_nodes, num_classes, avg_degree,
             A[isolated_idx, target_idx] = 1
             A[target_idx, isolated_idx] = 1
     
+    # Optional: rewire edges to increase structural diversity (preserving degree roughly)
+    if rewiring_rate > 0:
+        temp_data = Data(edge_index=A.nonzero().t(), num_nodes=num_nodes)
+        G_rewire = pyg_to_nx(temp_data, to_undirected=True)
+        try:
+            nswap = int(max(0, rewiring_rate) * max(1, G_rewire.number_of_edges()))
+            if nswap > 0:
+                nx.double_edge_swap(G_rewire, nswap=nswap, max_tries=nswap * 10)
+                # Rebuild A from rewired graph
+                A = torch.zeros_like(A)
+                for u, v in G_rewire.edges():
+                    A[u, v] = 1
+                    A[v, u] = 1
+        except Exception:
+            # Fallback: keep original A if swap fails
+            pass
+
     # Convert to edge_index format
     edge_index = A.nonzero().t()
     
@@ -244,7 +268,9 @@ def measure_label_homophily(data):
 
 
 def generate_dataset(num_graphs, num_nodes, num_classes, avg_degree, 
-                     label_homophily, start_seed=0, verbose=True, n_max_nodes=100):
+                     label_homophily, start_seed=0, verbose=True, n_max_nodes=100,
+                     homophily_jitter: float = 0.0, degree_jitter: float = 0.0,
+                     dirichlet_alpha: float = None, rewiring_rate: float = 0.0):
     """
     Generate a dataset of graphs with specified label homophily.
     
@@ -284,13 +310,32 @@ def generate_dataset(num_graphs, num_nodes, num_classes, avg_degree,
     
     for i in iterator:
         seed = start_seed + i
+        # Per-graph jitter for homophily and degree
+        if homophily_jitter > 0:
+            h_i = float(np.clip(np.random.normal(loc=label_homophily, scale=homophily_jitter), 0.0, 1.0))
+        else:
+            h_i = label_homophily
+        if degree_jitter > 0:
+            deg_scale = float(np.exp(np.random.normal(loc=0.0, scale=degree_jitter)))
+            avg_deg_i = max(1, int(round(avg_degree * deg_scale)))
+        else:
+            avg_deg_i = avg_degree
+
+        # Per-graph label proportions via Dirichlet (if provided)
+        if dirichlet_alpha is not None and dirichlet_alpha > 0:
+            class_probs = np.random.dirichlet(alpha=np.ones(num_classes) * dirichlet_alpha)
+        else:
+            class_probs = None
+
         data = generate_label_homophilic_graph(
             num_nodes=num_nodes,
             num_classes=num_classes,
-            avg_degree=avg_degree,
-            label_homophily=label_homophily,
+            avg_degree=avg_deg_i,
+            label_homophily=h_i,
             seed=seed,
-            n_max_nodes=n_max_nodes
+            n_max_nodes=n_max_nodes,
+            class_probs=class_probs,
+            rewiring_rate=rewiring_rate
         )
         
         # Measure actual properties
@@ -309,6 +354,10 @@ def generate_dataset(num_graphs, num_nodes, num_classes, avg_degree,
         'num_classes': num_classes,
         'target_avg_degree': avg_degree,
         'target_label_homophily': label_homophily,
+        'homophily_jitter': homophily_jitter,
+        'degree_jitter': degree_jitter,
+        'dirichlet_alpha': dirichlet_alpha,
+        'rewiring_rate': rewiring_rate,
         'actual_label_homophily_mean': np.mean(actual_homophilies),
         'actual_label_homophily_std': np.std(actual_homophilies),
         'actual_avg_degree_mean': np.mean(actual_degrees),
@@ -327,7 +376,9 @@ def generate_dataset(num_graphs, num_nodes, num_classes, avg_degree,
 
 def generate_multiple_homophily_levels(homophily_levels, num_graphs_per_level, 
                                        num_nodes, num_classes=5, avg_degree=8,
-                                       output_dir='data', start_seed=0, n_max_nodes=100):
+                                       output_dir='data', start_seed=0, n_max_nodes=100,
+                                       homophily_jitter: float = 0.0, degree_jitter: float = 0.0,
+                                       dirichlet_alpha: float = None, rewiring_rate: float = 0.0):
     """
     Generate datasets for multiple label homophily levels.
     
@@ -373,7 +424,11 @@ def generate_multiple_homophily_levels(homophily_levels, num_graphs_per_level,
             label_homophily=h,
             start_seed=start_seed,
             verbose=True,
-            n_max_nodes=n_max_nodes
+            n_max_nodes=n_max_nodes,
+            homophily_jitter=homophily_jitter,
+            degree_jitter=degree_jitter,
+            dirichlet_alpha=dirichlet_alpha,
+            rewiring_rate=rewiring_rate
         )
         
         # Save to file
@@ -509,11 +564,16 @@ if __name__ == '__main__':
     
     # Configuration
     HOMOPHILY_LEVELS = [0.5]
-    NUM_GRAPHS_PER_LEVEL = 2100  # 1000 S1 + 1000 S2 + 100 test
+    NUM_GRAPHS_PER_LEVEL = 5100  # 2500 S1 + 2500 S2 + 100 test
     NODE_SIZES = [5,10,20,30,40,50,100,500]
     NUM_CLASSES = 3
     AVG_DEGREE = 3
     OUTPUT_DIR = 'data'
+    # Diversity knobs (adjust as needed; defaults preserve prior behavior if zeros/None)
+    HOMOPHILY_JITTER = 0.05      # std-dev for per-graph h ~ N(h0, 0.05)
+    DEGREE_JITTER = 0.15         # log-normal jitter on avg degree (std in log-space)
+    DIRICHLET_ALPHA = 1.0        # label balance variability; None to disable
+    REWIRING_RATE = 0.05         # fraction of edges to swap per graph (approx)
     
     print("Label Homophily Graph Generator")
     print("="*60)
@@ -547,7 +607,11 @@ if __name__ == '__main__':
             avg_degree=AVG_DEGREE,
             output_dir=OUTPUT_DIR,
             start_seed=num_nodes * 10000,  # Different seed range per node size
-            n_max_nodes=n_max_nodes
+            n_max_nodes=n_max_nodes,
+            homophily_jitter=HOMOPHILY_JITTER,
+            degree_jitter=DEGREE_JITTER,
+            dirichlet_alpha=DIRICHLET_ALPHA,
+            rewiring_rate=REWIRING_RATE
         )
         
         # Visualize examples for each homophily level

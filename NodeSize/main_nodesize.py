@@ -173,6 +173,69 @@ def _cosine_matrix(A: np.ndarray, B: np.ndarray):
     return A_n @ B_n.T
 
 
+def _compute_fid(X: np.ndarray, Y: np.ndarray, eps: float = 1e-6) -> float:
+    """FID between two embedding sets X, Y (numpy arrays, shape [n, d])."""
+    X = np.asarray(X, dtype=np.float64)
+    Y = np.asarray(Y, dtype=np.float64)
+    if X.size == 0 or Y.size == 0:
+        return float('nan')
+    mu1, mu2 = X.mean(axis=0), Y.mean(axis=0)
+    c1 = np.cov(X, rowvar=False)
+    c2 = np.cov(Y, rowvar=False)
+    c1 = c1 + np.eye(c1.shape[0]) * eps
+    c2 = c2 + np.eye(c2.shape[0]) * eps
+    try:
+        from scipy.linalg import sqrtm
+        covmean = sqrtm(c1 @ c2)
+        if np.iscomplexobj(covmean):
+            covmean = covmean.real
+    except Exception:
+        # Fallback via eigendecomposition
+        w1, v1 = np.linalg.eigh(c1)
+        w1 = np.clip(w1, a_min=0.0, a_max=None)
+        s1 = (v1 * np.sqrt(w1 + eps)) @ v1.T
+        m = s1 @ c2 @ s1
+        wm, vm = np.linalg.eigh((m + m.T) / 2)
+        wm = np.clip(wm, a_min=0.0, a_max=None)
+        covmean = (vm * np.sqrt(wm + eps)) @ vm.T
+    diff = mu1 - mu2
+    fid = diff.dot(diff) + np.trace(c1 + c2 - 2 * covmean)
+    return float(fid)
+
+
+def _pairwise_sq_dists(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    na = np.sum(A * A, axis=1, keepdims=True)
+    nb = np.sum(B * B, axis=1, keepdims=True).T
+    return na + nb - 2.0 * (A @ B.T)
+
+
+def _compute_mmd_rbf(X: np.ndarray, Y: np.ndarray, gammas=None) -> float:
+    X = np.asarray(X, dtype=np.float64)
+    Y = np.asarray(Y, dtype=np.float64)
+    if X.size == 0 or Y.size == 0:
+        return float('nan')
+    if gammas is None:
+        Z = np.vstack([X, Y])
+        d2 = _pairwise_sq_dists(Z, Z)
+        positive = d2[d2 > 0]
+        if positive.size == 0:
+            gammas = [1.0]
+        else:
+            med = np.median(positive)
+            gamma = 1.0 / (2.0 * med)
+            gammas = [gamma, gamma * 0.5, gamma * 2.0]
+    d_xx = _pairwise_sq_dists(X, X)
+    d_yy = _pairwise_sq_dists(Y, Y)
+    d_xy = _pairwise_sq_dists(X, Y)
+    mmd = 0.0
+    for g in gammas:
+        k_xx = np.exp(-g * d_xx)
+        k_yy = np.exp(-g * d_yy)
+        k_xy = np.exp(-g * d_xy)
+        mmd += k_xx.mean() + k_yy.mean() - 2.0 * k_xy.mean()
+    return float(mmd / len(gammas))
+
+
 # --- WL helpers: force degree-only similarity regardless of available features ---
 def _strip_features(G):
     """Return a copy of G with any 'feature_vector' removed from nodes."""
@@ -488,14 +551,20 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
         gen_embed_sims = pair_cos.tolist()
 
     # 2) Memorization (nearest training cosine in embedding space)
+    mem_knn_k = 5
     # Gen1 -> S1
     if E_G1.shape[0] > 0 and E_S1.shape[0] > 0:
         C1 = _cosine_matrix(E_G1, E_S1)
-        mem_embed_sims_gen1 = np.max(C1, axis=1).tolist()
+        # Use mean of top-k neighbors (less saturating than pure max)
+        k = min(mem_knn_k, C1.shape[1])
+        topk1 = np.partition(C1, -k, axis=1)[:, -k:]
+        mem_embed_sims_gen1 = np.mean(topk1, axis=1).tolist()
     # Gen2 -> S2
     if E_G2.shape[0] > 0 and E_S2.shape[0] > 0:
         C2 = _cosine_matrix(E_G2, E_S2)
-        mem_embed_sims_gen2 = np.max(C2, axis=1).tolist()
+        k = min(mem_knn_k, C2.shape[1])
+        topk2 = np.partition(C2, -k, axis=1)[:, -k:]
+        mem_embed_sims_gen2 = np.mean(topk2, axis=1).tolist()
 
     gen_mean = np.mean(generalization_scores) if len(generalization_scores) > 0 else np.nan
     # Combine symmetric memorization scores for reporting/plots
@@ -515,9 +584,75 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
     if len(gen_embed_sims) > 0:
         print(f"  [Emb] Gen1↔Gen2 cosine:       {np.mean(gen_embed_sims):.4f} ± {np.std(gen_embed_sims):.4f}")
     if len(mem_embed_sims_gen1) > 0:
-        print(f"  [Emb] Gen1↔S1 (NN) cosine:   {np.mean(mem_embed_sims_gen1):.4f} ± {np.std(mem_embed_sims_gen1):.4f}")
+        print(f"  [Emb] Gen1↔S1 (top-{mem_knn_k}) cos: {np.mean(mem_embed_sims_gen1):.4f} ± {np.std(mem_embed_sims_gen1):.4f}")
     if len(mem_embed_sims_gen2) > 0:
-        print(f"  [Emb] Gen2↔S2 (NN) cosine:   {np.mean(mem_embed_sims_gen2):.4f} ± {np.std(mem_embed_sims_gen2):.4f}")
+        print(f"  [Emb] Gen2↔S2 (top-{mem_knn_k}) cos: {np.mean(mem_embed_sims_gen2):.4f} ± {np.std(mem_embed_sims_gen2):.4f}")
+
+    # Set-level distances (FID / MMD) - optional print for clarity
+    embed_set_metrics = None
+    if E_G1.shape[0] > 1 and E_G2.shape[0] > 1 and E_S1.shape[0] > 1 and E_S2.shape[0] > 1:
+        embed_set_metrics = {
+            'fid': {
+                'G1_S1': _compute_fid(E_G1, E_S1),
+                'G1_S2': _compute_fid(E_G1, E_S2),
+                'G2_S2': _compute_fid(E_G2, E_S2),
+                'G2_S1': _compute_fid(E_G2, E_S1),
+                'G1_G2': _compute_fid(E_G1, E_G2),
+            },
+            'mmd': {
+                'G1_S1': _compute_mmd_rbf(E_G1, E_S1),
+                'G1_S2': _compute_mmd_rbf(E_G1, E_S2),
+                'G2_S2': _compute_mmd_rbf(E_G2, E_S2),
+                'G2_S1': _compute_mmd_rbf(E_G2, E_S1),
+                'G1_G2': _compute_mmd_rbf(E_G1, E_G2),
+            }
+        }
+        print("  [Emb] Set distances (FID | MMD-RBF):")
+        print(f"       G1↔S1: {embed_set_metrics['fid']['G1_S1']:.6f} | {embed_set_metrics['mmd']['G1_S1']:.6f}    G1↔S2: {embed_set_metrics['fid']['G1_S2']:.6f} | {embed_set_metrics['mmd']['G1_S2']:.6f}")
+        print(f"       G2↔S2: {embed_set_metrics['fid']['G2_S2']:.6f} | {embed_set_metrics['mmd']['G2_S2']:.6f}    G2↔S1: {embed_set_metrics['fid']['G2_S1']:.6f} | {embed_set_metrics['mmd']['G2_S1']:.6f}")
+        print(f"       G1↔G2: {embed_set_metrics['fid']['G1_G2']:.6f} | {embed_set_metrics['mmd']['G1_G2']:.6f}")
+
+        # Save per-n text file with these values
+        with open(exp_dir / 'embed_set_metrics.txt', 'w') as ef:
+            ef.write('Pair,FID,MMD_RBF\n')
+            for pair in ['G1_S1','G1_S2','G2_S2','G2_S1','G1_G2']:
+                ef.write(f"{pair},{embed_set_metrics['fid'][pair]:.6f},{embed_set_metrics['mmd'][pair]:.6f}\n")
+
+        # Create simple bar plots for FID and MMD showing Gen1↔Gen2 vs chosen Mem (whichever separates more)
+        def _pick_mem_pair(metrics_dict):
+            # choose between G1_S1 and G2_S2 for larger separation from G1_G2
+            gen = metrics_dict['G1_G2']
+            cand = []
+            cand.append((abs(metrics_dict['G1_S1'] - gen), 'G1_S1'))
+            cand.append((abs(metrics_dict['G2_S2'] - gen), 'G2_S2'))
+            cand.sort(key=lambda x: x[0], reverse=True)
+            return cand[0][1]
+
+        fid_mem_pair = _pick_mem_pair(embed_set_metrics['fid'])
+        mmd_mem_pair = _pick_mem_pair(embed_set_metrics['mmd'])
+
+        fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+        # FID
+        axs[0].bar([0, 1], [embed_set_metrics['fid']['G1_G2'], embed_set_metrics['fid'][fid_mem_pair]], color=['blue','orange'], edgecolor='black')
+        axs[0].set_xticks([0, 1])
+        axs[0].set_xticklabels(['Gen1 vs Gen2', 'Gen vs Train'])
+        axs[0].set_ylabel('FID', fontsize=25)
+        axs[0].tick_params(axis='both', labelsize=14)
+        # MMD
+        axs[1].bar([0, 1], [embed_set_metrics['mmd']['G1_G2'], embed_set_metrics['mmd'][mmd_mem_pair]], color=['blue','orange'], edgecolor='black')
+        axs[1].set_xticks([0, 1])
+        axs[1].set_xticklabels(['Gen1 vs Gen2', 'Gen vs Train'])
+        axs[1].set_ylabel('MMD-RBF', fontsize=25)
+        axs[1].tick_params(axis='both', labelsize=14)
+        for ax in axs:
+            # No title per style; ensure large x-labels are readable
+            for label in ax.get_xticklabels():
+                label.set_fontsize(16)
+        fig_dir = output_dir / 'figures'
+        fig_dir.mkdir(exist_ok=True)
+        plt.tight_layout()
+        plt.savefig(fig_dir / f'embed_set_metrics_n{n_nodes}.png', dpi=300, bbox_inches='tight')
+        plt.close()
     print(f"\n  [WARNING] Empty Graph Statistics:")
     print(f"    Gen1 empty: {empty_gen1_count}/{total_gen1_graphs} ({empty_gen1_pct:.1f}%)")
     print(f"    Gen2 empty: {empty_gen2_count}/{total_gen2_graphs} ({empty_gen2_pct:.1f}%)")
@@ -604,7 +739,8 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
         'gen_embed_sims': gen_embed_sims,
         'mem_embed_sims_gen1': mem_embed_sims_gen1,
         'mem_embed_sims_gen2': mem_embed_sims_gen2,
-        'chosen_mem_label': chosen_mem_label,
+    'chosen_mem_label': chosen_mem_label,
+    'embed_set_metrics': embed_set_metrics,
     # Distributions for plots and logs
     'memorization_scores': memorization_scores,
     'memorization_scores_gen1': memorization_scores_gen1,
@@ -1158,6 +1294,10 @@ def main():
     progress_path = output_dir / "metrics_progress.txt"
     with open(progress_path, 'w') as pf:
         pf.write("n_nodes\tGen_WL_Mean\tGen_WL_Std\tMem_WL_Mean\tMem_WL_Std\n")
+    # Separate progress for embedding set metrics (FID/MMD)
+    embed_progress_path = output_dir / "embed_metrics_progress.txt"
+    with open(embed_progress_path, 'w') as ef:
+        ef.write("n_nodes\tFID_G1G2\tFID_G1S1\tFID_G2S2\tFID_G1S2\tFID_G2S1\tMMD_G1G2\tMMD_G1S1\tMMD_G2S2\tMMD_G1S2\tMMD_G2S1\n")
     
     print(f"\n{'='*80}")
     print("Graph Complexity Study: Memorization to Generalization")
@@ -1214,6 +1354,15 @@ def main():
         mem_std = float(np.std(result['memorization_scores'])) if len(result['memorization_scores']) > 0 else float('nan')
         with open(progress_path, 'a') as pf:
             pf.write(f"{n_nodes}\t{gen_mean:.4f}\t{gen_std:.4f}\t{mem_mean:.4f}\t{mem_std:.4f}\n")
+        # Append embedding set metrics for this n
+        esm = result.get('embed_set_metrics')
+        if esm is not None:
+            with open(embed_progress_path, 'a') as ef:
+                ef.write(
+                    f"{n_nodes}\t"
+                    f"{esm['fid']['G1_G2']:.6f}\t{esm['fid']['G1_S1']:.6f}\t{esm['fid']['G2_S2']:.6f}\t{esm['fid']['G1_S2']:.6f}\t{esm['fid']['G2_S1']:.6f}\t"
+                    f"{esm['mmd']['G1_G2']:.6f}\t{esm['mmd']['G1_S1']:.6f}\t{esm['mmd']['G2_S2']:.6f}\t{esm['mmd']['G1_S2']:.6f}\t{esm['mmd']['G2_S1']:.6f}\n"
+                )
         
         # Create immediate visualization for this n (don't wait till end)
         print(f"\n--- Creating immediate visualizations for n={n_nodes} ---")

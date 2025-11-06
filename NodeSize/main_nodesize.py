@@ -39,8 +39,10 @@ import matplotlib
 matplotlib.use('Agg')
 import networkx as nx
 import pandas as pd
+import torch.nn as nn
 
 from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GINConv, GCNConv, global_mean_pool
 from autoencoder import VariationalAutoEncoder
 from denoise_model import DenoiseNN, p_losses, sample
 from utils import (linear_beta_schedule, construct_nx_from_adj, 
@@ -58,7 +60,7 @@ from main_comparison import (
 )
 
 # Configuration
-FIXED_N = 1000  # Fixed training set size - always use 1000 graphs from S1 and S2
+FIXED_N = 2500  # Fixed training set size - always use 1000 graphs from S1 and S2
 NODE_SIZES = [5,10,20,30,50,100,500]  # Graph complexities to test (loop over n)
 TEST_SET_SIZE = 100  # Conditioning graphs
 SPLIT_SEED = 42
@@ -78,7 +80,7 @@ N_MAX_NODES = 500  # Maximum nodes (capped for computational feasibility)
 N_PROPERTIES = 15  # Updated from 18 to match labelhomgenerator (no structural/feature homophily)
 TIMESTEPS = 100
 NUM_SAMPLES_PER_CONDITION = 5
-K_NEAREST = 200  # shortlist size for k-nearest training comparisons
+K_NEAREST = 50  # shortlist size for k-nearest training comparisons
 
 BETA_KL_WEIGHT = 0.05
 SMALL_DATASET_THRESHOLD = 50
@@ -86,6 +88,89 @@ SMALL_DATASET_KL_WEIGHT = 0.01
 SMALL_DATASET_DROPOUT = 0.1
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+
+# --- Untrained-GNN embedding helpers (GIN/GCN) ---
+def _nx_to_pyg_data(G: nx.Graph):
+    """Convert nx.Graph to PyG Data with simple degree-based features [deg/max_deg, 1.0]."""
+    from torch_geometric.data import Data
+    n = G.number_of_nodes()
+    if n == 0:
+        x = torch.zeros((0, 2), dtype=torch.float32)
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+        batch = torch.zeros((0,), dtype=torch.long)
+        return Data(x=x, edge_index=edge_index), batch
+    nodes = list(G.nodes())
+    idx_map = {u: i for i, u in enumerate(nodes)}
+    max_deg = max(1, max((G.degree(u) for u in nodes), default=1))
+    feats = []
+    for u in nodes:
+        d = G.degree(u)
+        feats.append([d / max_deg, 1.0])
+    x = torch.tensor(feats, dtype=torch.float32)
+    edges = []
+    for u, v in G.edges():
+        iu, iv = idx_map[u], idx_map[v]
+        edges.append((iu, iv))
+        edges.append((iv, iu))
+    if len(edges) == 0:
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+    else:
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+    batch = torch.zeros((n,), dtype=torch.long)
+    return Data(x=x, edge_index=edge_index), batch
+
+
+class _RandomGIN(nn.Module):
+    def __init__(self, in_dim=2, hidden=64, out_dim=64, layers=3, seed=1234):
+        super().__init__()
+        torch.manual_seed(seed)
+        self.layers = nn.ModuleList()
+        last = in_dim
+        for _ in range(layers):
+            mlp = nn.Sequential(
+                nn.Linear(last, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, hidden)
+            )
+            self.layers.append(GINConv(mlp))
+            last = hidden
+        self.head = nn.Linear(last, out_dim)
+
+    def forward(self, data, batch):
+        x, edge_index = data.x, data.edge_index
+        for conv in self.layers:
+            x = conv(x, edge_index)
+            x = torch.relu(x)
+        g = global_mean_pool(x, batch)
+        z = self.head(g)
+        return z
+
+
+def _embed_graphs(model: nn.Module, graphs):
+    embs = []
+    model.eval()
+    with torch.no_grad():
+        for G in graphs:
+            data, batch = _nx_to_pyg_data(G)
+            if data.x.size(0) == 0:
+                z = torch.zeros((1, model.head.out_features), dtype=torch.float32)
+            else:
+                z = model(data, batch)
+            embs.append(z.squeeze(0).cpu().numpy())
+    if len(embs) == 0:
+        return np.zeros((0, getattr(model.head, 'out_features', 64)), dtype=np.float32)
+    return np.vstack(embs)
+
+
+def _cosine_matrix(A: np.ndarray, B: np.ndarray):
+    """Row-wise cosine similarities between all rows in A and all rows in B.
+    Returns matrix [len(A), len(B)]."""
+    if A.size == 0 or B.size == 0:
+        return np.zeros((A.shape[0], B.shape[0]), dtype=np.float32)
+    A_n = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-9)
+    B_n = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-9)
+    return A_n @ B_n.T
 
 
 # --- WL helpers: force degree-only similarity regardless of available features ---
@@ -259,10 +344,13 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
     
     # Generate and evaluate
     print(f"\n--- Generating & Evaluating ---")
-    generalization_scores = []  # Gen1 vs Gen2
+    generalization_scores = []  # Gen1 vs Gen2 (WL)
+    gen_embed_sims = []         # Gen1 vs Gen2 (cosine in GIN embedding)
     # Robust memorization across all generated samples (symmetric): Gen1↔S1 and Gen2↔S2
     memorization_scores_gen1 = []    # Gen1 vs closest S1 training
     memorization_scores_gen2 = []    # Gen2 vs closest S2 training
+    mem_embed_sims_gen1 = []         # Gen1 vs nearest S1 (cosine in embedding)
+    mem_embed_sims_gen2 = []         # Gen2 vs nearest S2 (cosine in embedding)
     empty_gen1_count = 0
     empty_gen2_count = 0
     
@@ -307,6 +395,10 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
     S1_degree_hists = _precompute_degree_hists(S1_training_graphs_nx, n_bins)
     S2_degree_hists = _precompute_degree_hists(S2_training_graphs_nx, n_bins)
     
+    # Prepare to accumulate generated graphs for embedding-based metrics
+    all_gen1_graphs = []
+    all_gen2_graphs = []
+
     for i, test_graph in enumerate(tqdm(test_graphs, desc=f"Testing (n={n_nodes}, N={N})")):
         # Get conditioning stats
         if isinstance(test_stats_cache, torch.Tensor) and len(test_stats_cache) > i:
@@ -331,6 +423,8 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
         for sample_idx in range(NUM_SAMPLES_PER_CONDITION):
             g1 = G1_samples[sample_idx]
             g2 = G2_samples[sample_idx]
+            all_gen1_graphs.append(g1)
+            all_gen2_graphs.append(g2)
             
             # Track empty graphs
             if g1.number_of_nodes() == 0:
@@ -346,7 +440,7 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
             if i == 0 and sample_idx < 2:
                 print(f"  Gen1 vs Gen2 sample {sample_idx}: WL similarity = {sim:.4f}")
         
-        # Robust memorization with k-NN prefilter on degree histograms
+        # Robust memorization with k-NN prefilter on degree histograms (WL)
         # Gen1 vs S1
         for g in G1_samples:
             _, sim_g1 = find_closest_graph_in_training_degree_only_k(g, S1_training_graphs_nx, S1_degree_hists, n_bins, K_NEAREST)
@@ -375,6 +469,34 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
                 test_sim = wl_similarity_degree_only(G1_samples[0], S1_training_graphs_nx[0])
                 print(f"  Direct WL test (degree-only) Gen1 vs first S1: {test_sim:.4f}")
     
+    # Build untrained GIN embedding and compute cosine-based metrics
+    embed_model = _RandomGIN(in_dim=2, hidden=64, out_dim=64, layers=3, seed=1234)
+    # Embed training sets once
+    E_S1 = _embed_graphs(embed_model, S1_training_graphs_nx)
+    E_S2 = _embed_graphs(embed_model, S2_training_graphs_nx)
+    # Embed all generated graphs
+    E_G1 = _embed_graphs(embed_model, all_gen1_graphs)
+    E_G2 = _embed_graphs(embed_model, all_gen2_graphs)
+
+    # 1) Generalization (Gen1 vs Gen2) cosine for paired samples
+    m = min(E_G1.shape[0], E_G2.shape[0])
+    if m > 0:
+        # Normalize then row-wise dot for pairs
+        G1n = E_G1[:m] / (np.linalg.norm(E_G1[:m], axis=1, keepdims=True) + 1e-9)
+        G2n = E_G2[:m] / (np.linalg.norm(E_G2[:m], axis=1, keepdims=True) + 1e-9)
+        pair_cos = np.sum(G1n * G2n, axis=1)
+        gen_embed_sims = pair_cos.tolist()
+
+    # 2) Memorization (nearest training cosine in embedding space)
+    # Gen1 -> S1
+    if E_G1.shape[0] > 0 and E_S1.shape[0] > 0:
+        C1 = _cosine_matrix(E_G1, E_S1)
+        mem_embed_sims_gen1 = np.max(C1, axis=1).tolist()
+    # Gen2 -> S2
+    if E_G2.shape[0] > 0 and E_S2.shape[0] > 0:
+        C2 = _cosine_matrix(E_G2, E_S2)
+        mem_embed_sims_gen2 = np.max(C2, axis=1).tolist()
+
     gen_mean = np.mean(generalization_scores) if len(generalization_scores) > 0 else np.nan
     # Combine symmetric memorization scores for reporting/plots
     memorization_scores = memorization_scores_gen1 + memorization_scores_gen2
@@ -389,6 +511,13 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
     print(f"\nResults:")
     print(f"  Generalization (Gen1 vs Gen2): {gen_mean:.4f} ± {np.std(generalization_scores):.4f}")
     print(f"  Memorization (symmetric):      {mem_mean:.4f} ± {np.std(memorization_scores):.4f}")
+    # Embedding metrics summary
+    if len(gen_embed_sims) > 0:
+        print(f"  [Emb] Gen1↔Gen2 cosine:       {np.mean(gen_embed_sims):.4f} ± {np.std(gen_embed_sims):.4f}")
+    if len(mem_embed_sims_gen1) > 0:
+        print(f"  [Emb] Gen1↔S1 (NN) cosine:   {np.mean(mem_embed_sims_gen1):.4f} ± {np.std(mem_embed_sims_gen1):.4f}")
+    if len(mem_embed_sims_gen2) > 0:
+        print(f"  [Emb] Gen2↔S2 (NN) cosine:   {np.mean(mem_embed_sims_gen2):.4f} ± {np.std(mem_embed_sims_gen2):.4f}")
     print(f"\n  [WARNING] Empty Graph Statistics:")
     print(f"    Gen1 empty: {empty_gen1_count}/{total_gen1_graphs} ({empty_gen1_pct:.1f}%)")
     print(f"    Gen2 empty: {empty_gen2_count}/{total_gen2_graphs} ({empty_gen2_pct:.1f}%)")
@@ -432,6 +561,36 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
     else:
         example_s2_graphs = []
     
+    # Decide which memorization comparator to plot against Gen↔Gen for nicer separation
+    chosen_mem_label = None
+    chosen_mem_sims = None
+    if len(gen_embed_sims) > 0:
+        mean_gen = float(np.mean(gen_embed_sims))
+        cand = []
+        if len(mem_embed_sims_gen1) > 0:
+            cand.append((abs(float(np.mean(mem_embed_sims_gen1)) - mean_gen), 'Gen1_vs_S1', mem_embed_sims_gen1))
+        if len(mem_embed_sims_gen2) > 0:
+            cand.append((abs(float(np.mean(mem_embed_sims_gen2)) - mean_gen), 'Gen2_vs_S2', mem_embed_sims_gen2))
+        if len(cand) > 0:
+            cand.sort(key=lambda x: x[0], reverse=True)
+            _, chosen_mem_label, chosen_mem_sims = cand[0]
+
+            # Plot simple histogram: Gen1↔Gen2 vs chosen memorization comparator (cosine)
+            fig, ax = plt.subplots(figsize=(6, 5))
+            bins = np.linspace(-1, 1, 41)
+            ax.hist(gen_embed_sims, bins=bins, alpha=0.5, color='blue', density=True, edgecolor='black', label='Gen1 vs Gen2')
+            ax.hist(chosen_mem_sims, bins=bins, alpha=0.5, color='orange', density=True, edgecolor='black', label=('Gen1 vs S1' if chosen_mem_label=='Gen1_vs_S1' else 'Gen2 vs S2'))
+            ax.set_xlabel('Cosine similarity', fontsize=25)
+            ax.set_ylabel('Density', fontsize=25)
+            ax.tick_params(axis='both', labelsize=14)
+            ax.set_xlim(-1.0, 1.0)
+            ax.legend(fontsize=12, loc='upper left')
+            fig_dir = output_dir / 'figures'
+            fig_dir.mkdir(exist_ok=True)
+            plt.tight_layout()
+            plt.savefig(fig_dir / f'embed_hist_mem_vs_gen_n{n_nodes}.png', dpi=300, bbox_inches='tight')
+            plt.close()
+
     return {
         'n_nodes': n_nodes,
         'N': N,
@@ -442,6 +601,10 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
         'dn_gen1_metrics': dn_gen1_metrics,
         'dn_gen2_metrics': dn_gen2_metrics,
         'generalization_scores': generalization_scores,
+        'gen_embed_sims': gen_embed_sims,
+        'mem_embed_sims_gen1': mem_embed_sims_gen1,
+        'mem_embed_sims_gen2': mem_embed_sims_gen2,
+        'chosen_mem_label': chosen_mem_label,
     # Distributions for plots and logs
     'memorization_scores': memorization_scores,
     'memorization_scores_gen1': memorization_scores_gen1,

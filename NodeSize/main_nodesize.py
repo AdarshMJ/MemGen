@@ -70,17 +70,17 @@ EPOCHS_AUTOENCODER = 100
 EPOCHS_DENOISER = 100
 EARLY_STOPPING_PATIENCE = 50
 BATCH_SIZE = 32
-LEARNING_RATE = 0.0001
+LEARNING_RATE = 0.001
 GRAD_CLIP = 1.0
 LATENT_DIM = 32
 HIDDEN_DIM_ENCODER = 32
 HIDDEN_DIM_DECODER = 64
-HIDDEN_DIM_DENOISE = 512
+HIDDEN_DIM_DENOISE = 64
 N_MAX_NODES = 500  # Maximum nodes (capped for computational feasibility)
 N_PROPERTIES = 15  # Updated from 18 to match labelhomgenerator (no structural/feature homophily)
 TIMESTEPS = 100
 NUM_SAMPLES_PER_CONDITION = 5
-K_NEAREST = 50  # shortlist size for k-nearest training comparisons
+K_NEAREST = 1  # shortlist size for k-nearest training comparisons
 
 BETA_KL_WEIGHT = 0.05
 SMALL_DATASET_THRESHOLD = 50
@@ -254,6 +254,49 @@ def wl_similarity_degree_only(G1, G2):
     return compute_wl_similarity(_strip_features(G1), _strip_features(G2))
 
 
+def wl_similarity_degree_feature(G1: nx.Graph, G2: nx.Graph, n_iter: int = 5, hash_base: int = 1_000_003) -> float:
+    """Feature-style WL similarity using degree as numeric feature with iterative hashing.
+
+    Initializes each node feature f(u) = degree(u) and refines for n_iter steps by hashing
+    the tuple (f(u), sorted(multiset of neighbor features)). At each iteration, accumulates
+    hashed pattern counts across the graph. Returns cosine similarity between count vectors.
+    """
+    if G1.number_of_nodes() == 0 or G2.number_of_nodes() == 0:
+        return 0.0
+
+    f1 = {u: float(G1.degree(u)) for u in G1.nodes}
+    f2 = {u: float(G2.degree(u)) for u in G2.nodes}
+
+    def refine(G, feats):
+        new_feats = {}
+        for u in G.nodes:
+            neigh_vals = [feats[v] for v in G.neighbors(u)]
+            neigh_vals_sorted = tuple(sorted(neigh_vals))
+            key = (feats[u], neigh_vals_sorted)
+            h = hash(key) % hash_base
+            new_feats[u] = h
+        return new_feats
+
+    counts1 = {}
+    counts2 = {}
+    for _ in range(max(1, n_iter)):
+        f1 = refine(G1, f1)
+        f2 = refine(G2, f2)
+        for _, h in f1.items():
+            counts1[h] = counts1.get(h, 0) + 1
+        for _, h in f2.items():
+            counts2[h] = counts2.get(h, 0) + 1
+
+    if not counts1 and not counts2:
+        return 1.0
+    keys = set(counts1.keys()) | set(counts2.keys())
+    v1 = np.array([counts1.get(k, 0) for k in keys], dtype=float)
+    v2 = np.array([counts2.get(k, 0) for k in keys], dtype=float)
+    denom = (np.linalg.norm(v1) * np.linalg.norm(v2))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(v1, v2) / denom)
+
 def find_closest_graph_in_training_degree_only(generated_G, training_graphs_nx):
     """Nearest neighbor in training under degree-only WL similarity."""
     best_sim = -1.0
@@ -320,9 +363,28 @@ def find_closest_graph_in_training_degree_only_k(generated_G, training_graphs_nx
     return best_G, best_sim
 
 
+def find_closest_graph_in_training_feature_k(generated_G, training_graphs_nx, train_hists, n_bins, k):
+    """Find best match using WL degree-feature within k-nearest by degree-hist prefilter."""
+    if len(training_graphs_nx) == 0:
+        return None, 0.0
+    cand_idxs = _k_nearest_indices_by_deg_hist(generated_G, train_hists, n_bins, k)
+    best_sim = -1.0
+    best_G = None
+    for idx in cand_idxs:
+        G_tr = training_graphs_nx[idx]
+        sim = wl_similarity_degree_feature(generated_G, G_tr, n_iter=5)
+        if sim > best_sim:
+            best_sim = sim
+            best_G = G_tr
+    if best_G is None:
+        best_G = training_graphs_nx[0]
+        best_sim = wl_similarity_degree_feature(generated_G, best_G, n_iter=5)
+    return best_G, best_sim
+
+
 def load_dataset(n_nodes):
     """Load dataset for specific node size."""
-    data_path = f'data/labelhomophily0.5_{n_nodes}nodes_graphs.pkl'
+    data_path = f'data/labelhomophily0.2_{n_nodes}nodes_graphs.pkl'
     print(f"\nLoading dataset: {data_path}")
     
     if not Path(data_path).exists():
@@ -333,6 +395,69 @@ def load_dataset(n_nodes):
     
     print(f"Loaded {len(data_list)} graphs with {n_nodes} nodes each")
     return data_list, data_path
+
+
+def _load_precomputed_splits(n_nodes, data_path, test_size, seed, stats_cache_path):
+    """If S1/S2/test pickles exist next to the pooled dataset, build a split_config.
+
+    Falls back to None if any of the expected files are missing.
+    """
+    dp = Path(data_path)
+    base = dp.name.replace('_graphs.pkl', '')  # e.g., labelhomophily0.2_30nodes
+    s1_path = dp.parent / f"{base}_S1.pkl"
+    s2_path = dp.parent / f"{base}_S2.pkl"
+    test_path = dp.parent / f"{base}_test.pkl"
+    if not (s1_path.exists() and s2_path.exists() and test_path.exists()):
+        return None
+    print(f"Found precomputed splits: {s1_path.name}, {s2_path.name}, {test_path.name}")
+    with open(s1_path, 'rb') as f:
+        S1_pool = pickle.load(f)
+    with open(s2_path, 'rb') as f:
+        S2_pool = pickle.load(f)
+    with open(test_path, 'rb') as f:
+        test_graphs = pickle.load(f)
+
+    # Synthetic indices (original indices unknown after external split)
+    S1_indices = np.arange(len(S1_pool))
+    S2_indices = np.arange(len(S2_pool))
+    test_indices = np.arange(len(test_graphs))
+
+    # Build/Load test conditioning stats cache
+    test_stats_cache = None
+    if stats_cache_path is not None and stats_cache_path.exists():
+        try:
+            cache_payload = torch.load(stats_cache_path, map_location='cpu')
+            if cache_payload.get('test_size') == test_size and cache_payload.get('seed') == seed:
+                cached_stats = cache_payload.get('stats')
+                if isinstance(cached_stats, torch.Tensor):
+                    test_stats_cache = cached_stats.float()
+                elif cached_stats is not None:
+                    test_stats_cache = torch.tensor(cached_stats, dtype=torch.float32)
+        except Exception as exc:
+            print(f"Warning: failed to load conditioning cache ({exc}); recomputing.")
+    if test_stats_cache is None:
+        stats_matrix = stack_stats(test_graphs)
+        test_stats_cache = torch.from_numpy(stats_matrix).float() if stats_matrix.size else torch.empty((0, N_PROPERTIES), dtype=torch.float32)
+        try:
+            stats_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({'seed': seed, 'test_size': test_size, 'test_indices': test_indices, 'stats': test_stats_cache.cpu(), 'n_properties': N_PROPERTIES}, stats_cache_path)
+            print(f"Saved conditioning stats cache to {stats_cache_path}")
+        except Exception as exc:
+            print(f"Warning: failed to save conditioning cache ({exc}).")
+
+    return {
+        'S1_pool': S1_pool,
+        'S1_indices': S1_indices,
+        'S2_pool': S2_pool,
+        'S2_indices': S2_indices,
+        'test_graphs': test_graphs,
+        'test_indices': test_indices,
+        'test_stats_cache': test_stats_cache,
+        'stats_cache_path': stats_cache_path,
+        'permutation': None,
+        'seed': seed,
+        'test_size': test_size
+    }
 
 
 def train_autoencoder(data_list, run_name, output_dir):
@@ -407,11 +532,14 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
     
     # Generate and evaluate
     print(f"\n--- Generating & Evaluating ---")
-    generalization_scores = []  # Gen1 vs Gen2 (WL)
+    generalization_scores = []  # Gen1 vs Gen2 (WL degree-only)
+    generalization_scores_feat = []  # Gen1 vs Gen2 (WL degree-feature, 5 iters)
     gen_embed_sims = []         # Gen1 vs Gen2 (cosine in GIN embedding)
     # Robust memorization across all generated samples (symmetric): Gen1↔S1 and Gen2↔S2
-    memorization_scores_gen1 = []    # Gen1 vs closest S1 training
-    memorization_scores_gen2 = []    # Gen2 vs closest S2 training
+    memorization_scores_gen1 = []    # Gen1 vs closest S1 training (WL deg-only)
+    memorization_scores_gen2 = []    # Gen2 vs closest S2 training (WL deg-only)
+    memorization_scores_gen1_feat = []  # Gen1 vs closest S1 training (WL deg-feature)
+    memorization_scores_gen2_feat = []  # Gen2 vs closest S2 training (WL deg-feature)
     mem_embed_sims_gen1 = []         # Gen1 vs nearest S1 (cosine in embedding)
     mem_embed_sims_gen2 = []         # Gen2 vs nearest S2 (cosine in embedding)
     empty_gen1_count = 0
@@ -498,20 +626,27 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
             # Degree-only WL similarity between Gen1 and Gen2 samples
             sim = wl_similarity_degree_only(g1, g2)
             generalization_scores.append(sim)
+            # Degree-feature WL similarity (5 iterations)
+            sim_feat = wl_similarity_degree_feature(g1, g2, n_iter=5)
+            generalization_scores_feat.append(sim_feat)
             
             # Debug first few
             if i == 0 and sample_idx < 2:
-                print(f"  Gen1 vs Gen2 sample {sample_idx}: WL similarity = {sim:.4f}")
+                print(f"  Gen1 vs Gen2 sample {sample_idx}: WL(degree-only) = {sim:.4f} | WL(deg-feature,5) = {sim_feat:.4f}")
         
         # Robust memorization with k-NN prefilter on degree histograms (WL)
         # Gen1 vs S1
         for g in G1_samples:
             _, sim_g1 = find_closest_graph_in_training_degree_only_k(g, S1_training_graphs_nx, S1_degree_hists, n_bins, K_NEAREST)
             memorization_scores_gen1.append(sim_g1)
+            _, sim_g1f = find_closest_graph_in_training_feature_k(g, S1_training_graphs_nx, S1_degree_hists, n_bins, K_NEAREST)
+            memorization_scores_gen1_feat.append(sim_g1f)
         # Gen2 vs S2 (symmetric)
         for g in G2_samples:
             _, sim_g2 = find_closest_graph_in_training_degree_only_k(g, S2_training_graphs_nx, S2_degree_hists, n_bins, K_NEAREST)
             memorization_scores_gen2.append(sim_g2)
+            _, sim_g2f = find_closest_graph_in_training_feature_k(g, S2_training_graphs_nx, S2_degree_hists, n_bins, K_NEAREST)
+            memorization_scores_gen2_feat.append(sim_g2f)
         
         # Debug: Print first few to check
         if i < 2:
@@ -524,9 +659,10 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
                 gen_has_feat = 'feature_vector' in G1_samples[0].nodes[first_node]
             # Print a quick nearest-neighbor sim snapshot for context
             dbg_closest, dbg_sim = find_closest_graph_in_training_degree_only_k(G1_samples[0], S1_training_graphs_nx, S1_degree_hists, n_bins, min(10, K_NEAREST))
+            dbg_closest_f, dbg_sim_f = find_closest_graph_in_training_feature_k(G1_samples[0], S1_training_graphs_nx, S1_degree_hists, n_bins, min(10, K_NEAREST))
             if dbg_closest is not None:
                 print(f"  Test {i}: Gen1 sample0 ({G1_samples[0].number_of_nodes()}n, {G1_samples[0].number_of_edges()}e, has_feat={gen_has_feat}) "
-                      f"vs closest S1 (deg-only WL), sim={dbg_sim:.4f}")
+                      f"vs closest S1 WLdeg={dbg_sim:.4f} | WLfeat={dbg_sim_f:.4f}")
             # Manual degree-only WL test between first gen and first train
             if i == 0 and len(S1_training_graphs_nx) > 0:
                 test_sim = wl_similarity_degree_only(G1_samples[0], S1_training_graphs_nx[0])
@@ -569,6 +705,7 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
     gen_mean = np.mean(generalization_scores) if len(generalization_scores) > 0 else np.nan
     # Combine symmetric memorization scores for reporting/plots
     memorization_scores = memorization_scores_gen1 + memorization_scores_gen2
+    memorization_scores_feat = memorization_scores_gen1_feat + memorization_scores_gen2_feat
     mem_mean = np.mean(memorization_scores) if len(memorization_scores) > 0 else np.nan
     
     # Calculate empty graph statistics
@@ -578,8 +715,12 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
     empty_gen2_pct = 100 * empty_gen2_count / total_gen2_graphs if total_gen2_graphs > 0 else 0
     
     print(f"\nResults:")
-    print(f"  Generalization (Gen1 vs Gen2): {gen_mean:.4f} ± {np.std(generalization_scores):.4f}")
-    print(f"  Memorization (symmetric):      {mem_mean:.4f} ± {np.std(memorization_scores):.4f}")
+    print(f"  Generalization (Gen1 vs Gen2) [WL deg-only]: {gen_mean:.4f} ± {np.std(generalization_scores):.4f}")
+    if len(generalization_scores_feat) > 0:
+        print(f"  Generalization (Gen1 vs Gen2) [WL deg-feature, iters=5]: {np.mean(generalization_scores_feat):.4f} ± {np.std(generalization_scores_feat):.4f}")
+    print(f"  Memorization (symmetric) [WL deg-only]:      {mem_mean:.4f} ± {np.std(memorization_scores):.4f}")
+    if len(memorization_scores_feat) > 0:
+        print(f"  Memorization (symmetric) [WL deg-feature]:   {np.mean(memorization_scores_feat):.4f} ± {np.std(memorization_scores_feat):.4f}")
     # Embedding metrics summary
     if len(gen_embed_sims) > 0:
         print(f"  [Emb] Gen1↔Gen2 cosine:       {np.mean(gen_embed_sims):.4f} ± {np.std(gen_embed_sims):.4f}")
@@ -736,6 +877,7 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
         'dn_gen1_metrics': dn_gen1_metrics,
         'dn_gen2_metrics': dn_gen2_metrics,
         'generalization_scores': generalization_scores,
+        'generalization_scores_feat': generalization_scores_feat,
         'gen_embed_sims': gen_embed_sims,
         'mem_embed_sims_gen1': mem_embed_sims_gen1,
         'mem_embed_sims_gen2': mem_embed_sims_gen2,
@@ -743,6 +885,7 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
     'embed_set_metrics': embed_set_metrics,
     # Distributions for plots and logs
     'memorization_scores': memorization_scores,
+    'memorization_scores_feat': memorization_scores_feat,
     'memorization_scores_gen1': memorization_scores_gen1,
     'memorization_scores_gen2': memorization_scores_gen2,
         'distribution_summary': distribution_summary,
@@ -1085,7 +1228,7 @@ def create_aggregate_visualizations(all_results, output_dir):
             mem_stds.append(np.std(mem_scores))
             complexity_ratios.append(result['complexity_ratio'])
     
-    # 1. Main histogram plot: Memorization to Generalization as n increases (histograms, no KDE)
+    # 1. Main histogram plot: Memorization to Generalization as n increases (WL deg-only)
     n_plots = len(n_vals)
     fig, axes = plt.subplots(1, n_plots, figsize=(5*n_plots, 5))
     if n_plots == 1:
@@ -1130,6 +1273,47 @@ def create_aggregate_visualizations(all_results, output_dir):
     plt.savefig(fig_dir / 'memorization_to_generalization_histograms.png', dpi=300, bbox_inches='tight')
     print(f"Saved: {fig_dir / 'memorization_to_generalization_histograms.png'}")
     plt.close()
+
+    # 1b. Feature-WL histogram plot: Memorization to Generalization using degree-feature WL
+    # Build lists if present
+    n_vals_f = []
+    for n_nodes in NODE_SIZES:
+        if n_nodes in all_results and 'generalization_scores_feat' in all_results[n_nodes] and 'memorization_scores_feat' in all_results[n_nodes]:
+            n_vals_f.append(n_nodes)
+    if len(n_vals_f) > 0:
+        n_plots = len(n_vals_f)
+        fig, axes = plt.subplots(1, n_plots, figsize=(5*n_plots, 5))
+        if n_plots == 1:
+            axes = [axes]
+        for idx, n_nodes in enumerate(n_vals_f):
+            result = all_results[n_nodes]
+            ax = axes[idx]
+            gen_scores = result.get('generalization_scores_feat', [])
+            mem_scores = result.get('memorization_scores_feat', [])
+            bins = np.linspace(0, 1, 21)
+            if len(mem_scores) > 0:
+                ax.hist(mem_scores, bins=bins, alpha=0.5, color='orange', label='Memorization (feat)', density=True, edgecolor='black')
+            if len(gen_scores) > 0:
+                ax.hist(gen_scores, bins=bins, alpha=0.5, color='blue', label='Generalization (feat)', density=True, edgecolor='black')
+            # Means
+            if len(gen_scores) > 0:
+                gen_mean_f = float(np.mean(gen_scores))
+                ax.axvline(gen_mean_f, color='darkblue', linestyle='--', linewidth=2.5, alpha=0.9)
+                ax.text(gen_mean_f, ax.get_ylim()[1]*0.9, f'{gen_mean_f:.2f}', ha='center', fontsize=12, color='darkblue', fontweight='bold', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            if len(mem_scores) > 0:
+                mem_mean_f = float(np.mean(mem_scores))
+                ax.axvline(mem_mean_f, color='darkorange', linestyle='--', linewidth=2.5, alpha=0.9)
+                ax.text(mem_mean_f, ax.get_ylim()[1]*0.8, f'{mem_mean_f:.2f}', ha='center', fontsize=12, color='darkorange', fontweight='bold', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            ax.set_xlabel('WL (degree-feature) Similarity', fontsize=25)
+            ax.set_ylabel('Density', fontsize=25)
+            ax.set_xlim(0, 1)
+            ax.tick_params(axis='both', labelsize=14)
+            if idx == 0:
+                ax.legend(fontsize=12, loc='upper left')
+        plt.tight_layout()
+        plt.savefig(fig_dir / 'memorization_to_generalization_histograms_feature.png', dpi=300, bbox_inches='tight')
+        print(f"Saved: {fig_dir / 'memorization_to_generalization_histograms_feature.png'}")
+        plt.close()
     
     # 2. Convergence line plot
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -1253,6 +1437,8 @@ def main():
                        help='Comma-separated list of node sizes to run (e.g., "10,30,50")')
     parser.add_argument('--k-nearest', type=int, default=100,
                        help='Use k-nearest shortlist for training matching (degree-hist prefilter)')
+    parser.add_argument('--use-pre-splits', action='store_true',
+                       help='If present, load S1/S2/test pickles saved next to the pooled dataset instead of shuffling internally.')
     args = parser.parse_args()
 
     # Optionally override module-level settings for quick experimentation
@@ -1294,6 +1480,10 @@ def main():
     progress_path = output_dir / "metrics_progress.txt"
     with open(progress_path, 'w') as pf:
         pf.write("n_nodes\tGen_WL_Mean\tGen_WL_Std\tMem_WL_Mean\tMem_WL_Std\n")
+    # Separate progress for feature-WL generalization
+    feat_wl_progress_path = output_dir / "wl_feature_metrics_progress.txt"
+    with open(feat_wl_progress_path, 'w') as ff:
+        ff.write("n_nodes\tGen_WLf_Mean\tGen_WLf_Std\n")
     # Separate progress for embedding set metrics (FID/MMD)
     embed_progress_path = output_dir / "embed_metrics_progress.txt"
     with open(embed_progress_path, 'w') as ef:
@@ -1330,14 +1520,21 @@ def main():
         n_output_dir = output_dir / f"n_{n_nodes}"
         n_output_dir.mkdir(exist_ok=True)
         
-        # Split dataset
-        cache_path = Path(data_path).parent / "cache" / f"labelhomophily0.5_{n_nodes}nodes_test_stats_seed{SPLIT_SEED}_size{TEST_SET_SIZE}.pt"
-        split_config = shuffle_and_split_dataset(
-            data_list,
-            test_size=TEST_SET_SIZE,
-            seed=SPLIT_SEED,
-            stats_cache_path=cache_path
-        )
+        # Split dataset: prefer precomputed splits if requested or found
+        cache_path = Path(data_path).parent / "cache" / f"labelhomophily0.2_{n_nodes}nodes_test_stats_seed{SPLIT_SEED}_size{TEST_SET_SIZE}.pt"
+        split_config = None
+        if args.use_pre_splits:
+            split_config = _load_precomputed_splits(n_nodes, data_path, TEST_SET_SIZE, SPLIT_SEED, cache_path)
+        else:
+            # Auto-detect pre-splits and use them if available
+            split_config = _load_precomputed_splits(n_nodes, data_path, TEST_SET_SIZE, SPLIT_SEED, cache_path)
+        if split_config is None:
+            split_config = shuffle_and_split_dataset(
+                data_list,
+                test_size=TEST_SET_SIZE,
+                seed=SPLIT_SEED,
+                stats_cache_path=cache_path
+            )
         
         # Run experiment with fixed N=1000
         result = run_experiment_for_n(n_nodes, split_config, n_output_dir)
@@ -1354,6 +1551,11 @@ def main():
         mem_std = float(np.std(result['memorization_scores'])) if len(result['memorization_scores']) > 0 else float('nan')
         with open(progress_path, 'a') as pf:
             pf.write(f"{n_nodes}\t{gen_mean:.4f}\t{gen_std:.4f}\t{mem_mean:.4f}\t{mem_std:.4f}\n")
+        # Append feature-WL generalization metrics
+        gfeat = result.get('generalization_scores_feat', [])
+        if gfeat is not None and len(gfeat) > 0:
+            with open(feat_wl_progress_path, 'a') as ff:
+                ff.write(f"{n_nodes}\t{float(np.mean(gfeat)):.4f}\t{float(np.std(gfeat)):.4f}\n")
         # Append embedding set metrics for this n
         esm = result.get('embed_set_metrics')
         if esm is not None:

@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
+import scipy.sparse as sparse
+import scipy as sp
 import torch
 import networkx as nx
 import matplotlib
@@ -259,11 +261,84 @@ def ensure_connected(edges: List[Tuple[int, int]], n: int, labels: np.ndarray, t
     return new_edges
 
 
+def compute_node_features_with_bfs(edges: List[Tuple[int, int]], n: int, spectral_dim: int = 10, n_max_nodes: int = 100) -> Tuple[torch.Tensor, np.ndarray]:
+    """Compute node features using BFS ordering, degree, and Laplacian eigenvectors.
+    
+    This mirrors the approach in main.py:
+    1. Build networkx graph
+    2. Apply BFS ordering from highest-degree node in each component
+    3. Compute normalized Laplacian eigenvectors
+    4. Create features: [normalized_degree, eigenvector_1, ..., eigenvector_k]
+    
+    Args:
+        edges: List of (u, v) edge tuples
+        n: Number of nodes
+        spectral_dim: Number of Laplacian eigenvectors to include
+        n_max_nodes: Maximum nodes for normalization
+        
+    Returns:
+        node_features: [n, spectral_dim+1] tensor
+        bfs_node_list: Array mapping new_idx -> original_idx
+    """
+    # Build networkx graph
+    G = nx.Graph()
+    G.add_nodes_from(range(n))
+    G.add_edges_from([(int(u), int(v)) for u, v in edges if u != v])
+    
+    # Get connected components, sorted by size
+    CGs = [G.subgraph(c) for c in nx.connected_components(G)]
+    CGs = sorted(CGs, key=lambda x: x.number_of_nodes(), reverse=True)
+    
+    # BFS ordering from highest-degree node in each component
+    node_list_bfs = []
+    for component in CGs:
+        node_degree_list = [(n, d) for n, d in component.degree()]
+        degree_sequence = sorted(node_degree_list, key=lambda tt: tt[1], reverse=True)
+        bfs_tree = nx.bfs_tree(component, source=degree_sequence[0][0])
+        node_list_bfs += list(bfs_tree.nodes())
+    
+    # Build adjacency matrix in BFS order
+    adj_bfs = nx.to_numpy_array(G, nodelist=node_list_bfs)
+    adj = torch.from_numpy(adj_bfs).float()
+    
+    # Compute normalized Laplacian
+    diags = np.sum(adj_bfs, axis=0)
+    diags = np.squeeze(np.asarray(diags))
+    D = sparse.diags(diags).toarray()
+    L = D - adj_bfs
+    
+    with np.errstate(divide="ignore"):
+        diags_sqrt = 1.0 / np.sqrt(diags)
+    diags_sqrt[np.isinf(diags_sqrt)] = 0
+    DH = sparse.diags(diags_sqrt).toarray()
+    L = np.linalg.multi_dot((DH, L, DH))
+    L = torch.from_numpy(L).float()
+    
+    # Compute eigenvalues and eigenvectors
+    eigval, eigvecs = torch.linalg.eigh(L)
+    eigval = torch.real(eigval)
+    eigvecs = torch.real(eigvecs)
+    idx = torch.argsort(eigval)
+    eigvecs = eigvecs[:, idx]
+    
+    # Build node features: [normalized_degree, eigenvector_1, ..., eigenvector_k]
+    x = torch.zeros(n, spectral_dim + 1)
+    # Normalized degree (using n_max_nodes for consistency with main.py)
+    x[:, 0] = torch.mm(adj, torch.ones(n, 1))[:, 0] / (n_max_nodes - 1)
+    # Eigenvectors (take up to spectral_dim)
+    mn = min(n, spectral_dim)
+    x[:, 1:mn+1] = eigvecs[:, :mn]
+    
+    return x, np.array(node_list_bfs, dtype=np.int64)
+
+
 def generate_single_graph(
     templates: Sequence[SeedStats],
     n: int,
     target_hom: float,
     jitter: float,
+    spectral_dim: int = 10,
+    n_max_nodes: int = 100,
 ) -> Tuple[Data, Dict[str, float]]:
     for attempt in range(50):
         template = random.choice(templates)
@@ -278,9 +353,26 @@ def generate_single_graph(
         # Ensure connectivity
         edges = ensure_connected(edges, n, labels, target_hom)
 
-        edge_array = np.array(edges, dtype=np.int64)
+        # Compute node features with BFS ordering
+        node_features, bfs_node_list = compute_node_features_with_bfs(
+            edges, n, spectral_dim=spectral_dim, n_max_nodes=n_max_nodes
+        )
+        
+        # Reorder edges according to BFS ordering
+        # Create mapping from original -> BFS index
+        orig_to_bfs = {int(orig_idx): bfs_idx for bfs_idx, orig_idx in enumerate(bfs_node_list)}
+        edges_reordered = [(orig_to_bfs[u], orig_to_bfs[v]) for u, v in edges]
+        
+        # Reorder labels according to BFS
+        labels_reordered = labels[bfs_node_list]
+
+        edge_array = np.array(edges_reordered, dtype=np.int64)
         edge_index = torch.from_numpy(edge_array.T.copy()).long()
-        data = Data(edge_index=edge_index, y=torch.from_numpy(labels).long())
+        data = Data(
+            x=node_features,
+            edge_index=edge_index,
+            y=torch.from_numpy(labels_reordered).long()
+        )
         data.num_nodes = n
 
         realised_hom = realised_label_hom(edges, labels)
@@ -324,6 +416,8 @@ def generate_dataset_splits(
     test_count: int,
     target_hom: float,
     jitter: float,
+    spectral_dim: int = 10,
+    n_max_nodes: int = 100,
 ) -> Dict[str, List[Tuple[Data, Dict[str, float]]]]:
     required = 2 * train_per_set + test_count
     if total_graphs < required:
@@ -336,6 +430,8 @@ def generate_dataset_splits(
             n=node_size,
             target_hom=target_hom,
             jitter=jitter,
+            spectral_dim=spectral_dim,
+            n_max_nodes=n_max_nodes,
         )
         graphs.append((graph, meta))
         if len(graphs) % 200 == 0:
@@ -452,6 +548,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--planetoid-root", type=str, default="./planetoid", help="Planetoid dataset root directory")
     parser.add_argument("--visualize", action="store_true", help="Generate example visualizations after creating splits")
     parser.add_argument("--viz-examples", type=int, default=6, help="Number of example graphs to visualize (default: 6)")
+    parser.add_argument("--spectral-dim", type=int, default=10, help="Number of Laplacian eigenvectors to use as node features (default: 10)")
+    parser.add_argument("--n-max-nodes", type=int, default=100, help="Maximum number of nodes for degree normalization (default: 100)")
     return parser.parse_args()
 
 
@@ -475,6 +573,8 @@ def main() -> None:
             test_count=args.test_count,
             target_hom=args.target_hom,
             jitter=args.pair_jitter,
+            spectral_dim=args.spectral_dim,
+            n_max_nodes=args.n_max_nodes,
         )
         save_split(args.output_dir, node_size, split)
         print(f"Finished node size {node_size} -> {args.output_dir}/node_{node_size}")

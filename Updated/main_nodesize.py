@@ -19,12 +19,7 @@ Experiment:
   - Generate graphs with both models using same random seed
   - Compare: Gen1 vs Gen2 (generalization) vs training set (memorization)
 - Create histogram showing memorization→generalization as n increases
-
-Hypothesis:
-- Small n (simple graphs): Models generalize (Gen1 ≈ Gen2)
-- Large n (complex graphs): Models memorize (Gen1 ≠ Gen2, each similar to own training set)
-- With fixed N=1000, complexity/dataset ratio increases with n
-- Transition point reveals when task complexity overwhelms available data
+Author: Adarsh Jamadandi
 """
 
 import argparse
@@ -35,20 +30,15 @@ from pathlib import Path
 from tqdm import tqdm
 from datetime import datetime
 import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')
 import networkx as nx
 import pandas as pd
 import torch.nn as nn
 
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GINConv, GCNConv, global_mean_pool
 from autoencoder import VariationalAutoEncoder
 from denoise_model import DenoiseNN, p_losses, sample
 from utils import (linear_beta_schedule, construct_nx_from_adj, 
                    eval_autoencoder, gen_stats)
-from grakel import WeisfeilerLehman, VertexHistogram
-from grakel.utils import graph_from_networkx
 
 # Import functions from main_comparison.py
 import sys
@@ -61,7 +51,7 @@ from main_comparison import (
 
 # Configuration
 FIXED_N = 2500  # Fixed training set size - always use 1000 graphs from S1 and S2
-NODE_SIZES = [5,10,20,30,50,100,500]  # Graph complexities to test (loop over n)
+NODE_SIZES = [800]  # Graph complexities to test (loop over n)
 TEST_SET_SIZE = 100  # Conditioning graphs
 SPLIT_SEED = 42
 
@@ -70,15 +60,15 @@ EPOCHS_AUTOENCODER = 100
 EPOCHS_DENOISER = 100
 EARLY_STOPPING_PATIENCE = 50
 BATCH_SIZE = 32
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0001
 GRAD_CLIP = 1.0
 LATENT_DIM = 32
 HIDDEN_DIM_ENCODER = 32
 HIDDEN_DIM_DECODER = 64
-HIDDEN_DIM_DENOISE = 64
-N_MAX_NODES = 500  # Maximum nodes (capped for computational feasibility)
+HIDDEN_DIM_DENOISE = 512
+N_MAX_NODES = 800  # Maximum nodes (capped for computational feasibility)
 N_PROPERTIES = 15  # Updated from 18 to match labelhomgenerator (no structural/feature homophily)
-TIMESTEPS = 100
+TIMESTEPS = 500
 NUM_SAMPLES_PER_CONDITION = 5
 K_NEAREST = 1  # shortlist size for k-nearest training comparisons
 
@@ -88,7 +78,24 @@ SMALL_DATASET_KL_WEIGHT = 0.01
 SMALL_DATASET_DROPOUT = 0.1
 USE_BIAS = True  # Default: use bias in all models (can be overridden via --no-bias)
 
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+# Device detection: TPU > CUDA > CPU
+USE_TPU = False
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    try:
+        device = torch_xla.device()  # Call the function to get device
+        print(f"✅ Using TPU device: {device}")
+        USE_TPU = True
+    except RuntimeError as e:
+        print(f"⚠️  TPU initialization failed: {e}")
+        print(f"⚠️  Falling back to CUDA/CPU")
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        USE_TPU = False
+        print(f"Using device: {device}")
+except ImportError:
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
 
 
 # --- Untrained-GNN embedding helpers (GIN/GCN) ---
@@ -122,121 +129,6 @@ def _nx_to_pyg_data(G: nx.Graph):
     return Data(x=x, edge_index=edge_index), batch
 
 
-class _RandomGIN(nn.Module):
-    def __init__(self, in_dim=2, hidden=64, out_dim=64, layers=3, seed=1234):
-        super().__init__()
-        torch.manual_seed(seed)
-        self.layers = nn.ModuleList()
-        last = in_dim
-        for _ in range(layers):
-            mlp = nn.Sequential(
-                nn.Linear(last, hidden),
-                nn.ReLU(),
-                nn.Linear(hidden, hidden)
-            )
-            self.layers.append(GINConv(mlp))
-            last = hidden
-        self.head = nn.Linear(last, out_dim)
-
-    def forward(self, data, batch):
-        x, edge_index = data.x, data.edge_index
-        for conv in self.layers:
-            x = conv(x, edge_index)
-            x = torch.relu(x)
-        g = global_mean_pool(x, batch)
-        z = self.head(g)
-        return z
-
-
-def _embed_graphs(model: nn.Module, graphs):
-    embs = []
-    model.eval()
-    with torch.no_grad():
-        for G in graphs:
-            data, batch = _nx_to_pyg_data(G)
-            if data.x.size(0) == 0:
-                z = torch.zeros((1, model.head.out_features), dtype=torch.float32)
-            else:
-                z = model(data, batch)
-            embs.append(z.squeeze(0).cpu().numpy())
-    if len(embs) == 0:
-        return np.zeros((0, getattr(model.head, 'out_features', 64)), dtype=np.float32)
-    return np.vstack(embs)
-
-
-def _cosine_matrix(A: np.ndarray, B: np.ndarray):
-    """Row-wise cosine similarities between all rows in A and all rows in B.
-    Returns matrix [len(A), len(B)]."""
-    if A.size == 0 or B.size == 0:
-        return np.zeros((A.shape[0], B.shape[0]), dtype=np.float32)
-    A_n = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-9)
-    B_n = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-9)
-    return A_n @ B_n.T
-
-
-def _compute_fid(X: np.ndarray, Y: np.ndarray, eps: float = 1e-6) -> float:
-    """FID between two embedding sets X, Y (numpy arrays, shape [n, d])."""
-    X = np.asarray(X, dtype=np.float64)
-    Y = np.asarray(Y, dtype=np.float64)
-    if X.size == 0 or Y.size == 0:
-        return float('nan')
-    mu1, mu2 = X.mean(axis=0), Y.mean(axis=0)
-    c1 = np.cov(X, rowvar=False)
-    c2 = np.cov(Y, rowvar=False)
-    c1 = c1 + np.eye(c1.shape[0]) * eps
-    c2 = c2 + np.eye(c2.shape[0]) * eps
-    try:
-        from scipy.linalg import sqrtm
-        covmean = sqrtm(c1 @ c2)
-        if np.iscomplexobj(covmean):
-            covmean = covmean.real
-    except Exception:
-        # Fallback via eigendecomposition
-        w1, v1 = np.linalg.eigh(c1)
-        w1 = np.clip(w1, a_min=0.0, a_max=None)
-        s1 = (v1 * np.sqrt(w1 + eps)) @ v1.T
-        m = s1 @ c2 @ s1
-        wm, vm = np.linalg.eigh((m + m.T) / 2)
-        wm = np.clip(wm, a_min=0.0, a_max=None)
-        covmean = (vm * np.sqrt(wm + eps)) @ vm.T
-    diff = mu1 - mu2
-    fid = diff.dot(diff) + np.trace(c1 + c2 - 2 * covmean)
-    return float(fid)
-
-
-def _pairwise_sq_dists(A: np.ndarray, B: np.ndarray) -> np.ndarray:
-    na = np.sum(A * A, axis=1, keepdims=True)
-    nb = np.sum(B * B, axis=1, keepdims=True).T
-    return na + nb - 2.0 * (A @ B.T)
-
-
-def _compute_mmd_rbf(X: np.ndarray, Y: np.ndarray, gammas=None) -> float:
-    X = np.asarray(X, dtype=np.float64)
-    Y = np.asarray(Y, dtype=np.float64)
-    if X.size == 0 or Y.size == 0:
-        return float('nan')
-    if gammas is None:
-        Z = np.vstack([X, Y])
-        d2 = _pairwise_sq_dists(Z, Z)
-        positive = d2[d2 > 0]
-        if positive.size == 0:
-            gammas = [1.0]
-        else:
-            med = np.median(positive)
-            gamma = 1.0 / (2.0 * med)
-            gammas = [gamma, gamma * 0.5, gamma * 2.0]
-    d_xx = _pairwise_sq_dists(X, X)
-    d_yy = _pairwise_sq_dists(Y, Y)
-    d_xy = _pairwise_sq_dists(X, Y)
-    mmd = 0.0
-    for g in gammas:
-        k_xx = np.exp(-g * d_xx)
-        k_yy = np.exp(-g * d_yy)
-        k_xy = np.exp(-g * d_xy)
-        mmd += k_xx.mean() + k_yy.mean() - 2.0 * k_xy.mean()
-    return float(mmd / len(gammas))
-
-
 # --- WL helpers: force degree-only similarity regardless of available features ---
 def _strip_features(G):
     """Return a copy of G with any 'feature_vector' removed from nodes."""
@@ -254,49 +146,6 @@ def wl_similarity_degree_only(G1, G2):
     """Compute WL similarity using degree-only labels by stripping node features."""
     return compute_wl_similarity(_strip_features(G1), _strip_features(G2))
 
-
-def wl_similarity_degree_feature(G1: nx.Graph, G2: nx.Graph, n_iter: int = 5, hash_base: int = 1_000_003) -> float:
-    """Feature-style WL similarity using degree as numeric feature with iterative hashing.
-
-    Initializes each node feature f(u) = degree(u) and refines for n_iter steps by hashing
-    the tuple (f(u), sorted(multiset of neighbor features)). At each iteration, accumulates
-    hashed pattern counts across the graph. Returns cosine similarity between count vectors.
-    """
-    if G1.number_of_nodes() == 0 or G2.number_of_nodes() == 0:
-        return 0.0
-
-    f1 = {u: float(G1.degree(u)) for u in G1.nodes}
-    f2 = {u: float(G2.degree(u)) for u in G2.nodes}
-
-    def refine(G, feats):
-        new_feats = {}
-        for u in G.nodes:
-            neigh_vals = [feats[v] for v in G.neighbors(u)]
-            neigh_vals_sorted = tuple(sorted(neigh_vals))
-            key = (feats[u], neigh_vals_sorted)
-            h = hash(key) % hash_base
-            new_feats[u] = h
-        return new_feats
-
-    counts1 = {}
-    counts2 = {}
-    for _ in range(max(1, n_iter)):
-        f1 = refine(G1, f1)
-        f2 = refine(G2, f2)
-        for _, h in f1.items():
-            counts1[h] = counts1.get(h, 0) + 1
-        for _, h in f2.items():
-            counts2[h] = counts2.get(h, 0) + 1
-
-    if not counts1 and not counts2:
-        return 1.0
-    keys = set(counts1.keys()) | set(counts2.keys())
-    v1 = np.array([counts1.get(k, 0) for k in keys], dtype=float)
-    v2 = np.array([counts2.get(k, 0) for k in keys], dtype=float)
-    denom = (np.linalg.norm(v1) * np.linalg.norm(v2))
-    if denom == 0:
-        return 0.0
-    return float(np.dot(v1, v2) / denom)
 
 def find_closest_graph_in_training_degree_only(generated_G, training_graphs_nx):
     """Nearest neighbor in training under degree-only WL similarity."""
@@ -331,6 +180,38 @@ def _precompute_degree_hists(training_graphs_nx, n_bins):
     return np.stack([_degree_histogram_normalized(G, n_bins) for G in training_graphs_nx], axis=0) if len(training_graphs_nx) > 0 else np.zeros((0, n_bins), dtype=np.float32)
 
 
+def _precompute_degree_hists_from_pyg(pyg_data_list, n_bins):
+    """Memory-efficient: compute degree histograms directly from PyG Data without NetworkX conversion."""
+    hists = []
+    for data in pyg_data_list:
+        # Count degrees from edge_index
+        if data.edge_index.numel() == 0:
+            hist = np.zeros(n_bins, dtype=np.float32)
+        else:
+            edge_index = data.edge_index.cpu().numpy()
+            degrees = np.bincount(edge_index[0], minlength=data.num_nodes)
+            # Normalize histogram
+            hist = np.bincount(degrees, minlength=n_bins)[:n_bins].astype(np.float32)
+            if hist.sum() > 0:
+                hist = hist / hist.sum()
+        hists.append(hist)
+    return np.stack(hists, axis=0) if len(hists) > 0 else np.zeros((0, n_bins), dtype=np.float32)
+
+
+def _pyg_to_nx(data):
+    """Convert a single PyG Data object to NetworkX on-the-fly."""
+    if hasattr(data, 'A') and data.A is not None:
+        adj = data.A[0].cpu().numpy()
+    else:
+        n_nodes = data.num_nodes
+        adj = np.zeros((n_nodes, n_nodes))
+        if data.edge_index.numel() > 0:
+            edge_index = data.edge_index.cpu().numpy()
+            adj[edge_index[0], edge_index[1]] = 1.0
+    features = data.x.detach().cpu().numpy() if hasattr(data, 'x') else None
+    return construct_nx_from_adj(adj, node_features=features)
+
+
 def _k_nearest_indices_by_deg_hist(generated_G, train_hists, n_bins, k):
     """Return indices of k nearest training graphs by L1 distance on degree histograms."""
     if train_hists.shape[0] == 0:
@@ -344,42 +225,32 @@ def _k_nearest_indices_by_deg_hist(generated_G, train_hists, n_bins, k):
     return idxs.tolist()
 
 
-def find_closest_graph_in_training_degree_only_k(generated_G, training_graphs_nx, train_hists, n_bins, k):
-    """Find best match using degree-only WL within k-nearest by degree-hist prefilter."""
-    if len(training_graphs_nx) == 0:
+def find_closest_graph_in_training_degree_only_k(generated_G, training_pyg_data, train_hists, n_bins, k):
+    """Find best match using degree-only WL within k-nearest by degree-hist prefilter.
+    
+    Args:
+        generated_G: NetworkX graph
+        training_pyg_data: List of PyG Data objects (converted on-the-fly)
+        train_hists: Precomputed degree histograms
+        n_bins: Number of bins for histograms
+        k: Number of candidates to check
+    """
+    if len(training_pyg_data) == 0:
         return None, 0.0
     cand_idxs = _k_nearest_indices_by_deg_hist(generated_G, train_hists, n_bins, k)
     best_sim = -1.0
     best_G = None
     for idx in cand_idxs:
-        G_tr = training_graphs_nx[idx]
+        # Convert on-the-fly (only k graphs, not all 2500!)
+        G_tr = _pyg_to_nx(training_pyg_data[idx])
         sim = wl_similarity_degree_only(generated_G, G_tr)
         if sim > best_sim:
             best_sim = sim
             best_G = G_tr
     if best_G is None:
         # fallback: compute against first element
-        best_G = training_graphs_nx[0]
+        best_G = _pyg_to_nx(training_pyg_data[0])
         best_sim = wl_similarity_degree_only(generated_G, best_G)
-    return best_G, best_sim
-
-
-def find_closest_graph_in_training_feature_k(generated_G, training_graphs_nx, train_hists, n_bins, k):
-    """Find best match using WL degree-feature within k-nearest by degree-hist prefilter."""
-    if len(training_graphs_nx) == 0:
-        return None, 0.0
-    cand_idxs = _k_nearest_indices_by_deg_hist(generated_G, train_hists, n_bins, k)
-    best_sim = -1.0
-    best_G = None
-    for idx in cand_idxs:
-        G_tr = training_graphs_nx[idx]
-        sim = wl_similarity_degree_feature(generated_G, G_tr, n_iter=5)
-        if sim > best_sim:
-            best_sim = sim
-            best_G = G_tr
-    if best_G is None:
-        best_G = training_graphs_nx[0]
-        best_sim = wl_similarity_degree_feature(generated_G, best_G, n_iter=5)
     return best_G, best_sim
 
 
@@ -417,6 +288,7 @@ def _prepare_seeded_graph(data_pyg, meta, n_nodes):
     - edge_index: [2, num_edges] edge list
     - y: [num_nodes] label tensor
     - num_nodes: int
+    - x: [num_nodes, feature_dim] node features (degree + Laplacian eigenvectors, BFS ordered)
     
     We need to add:
     - adj: [N_MAX_NODES, N_MAX_NODES] adjacency matrix (padded)
@@ -430,15 +302,18 @@ def _prepare_seeded_graph(data_pyg, meta, n_nodes):
     adj_padded = torch.zeros((N_MAX_NODES, N_MAX_NODES), dtype=torch.float32)
     adj_padded[:n_nodes, :n_nodes] = adj_dense
     
-    # Compute graph statistics using gen_stats (returns numpy array of 15 stats)
+    # Get graph statistics from metadata (CRITICAL: avoid expensive recomputation)
     stats_array = None
     if meta is not None and 'stats' in meta and meta['stats'] is not None:
         try:
             stats_array = np.asarray(meta['stats']).ravel()
-        except Exception:
+        except Exception as e:
+            print(f"    Warning: Failed to load stats from metadata: {e}")
             stats_array = None
 
     if stats_array is None:
+        # EXPENSIVE FALLBACK: Only compute if absolutely necessary (shouldn't happen with seeded generator)
+        print(f"    ⚠️  WARNING: Computing stats from scratch (this is slow!) - consider regenerating dataset with stats")
         G = nx.Graph()
         G.add_nodes_from(range(n_nodes))
         edges = data_pyg.edge_index.t().tolist()
@@ -450,15 +325,20 @@ def _prepare_seeded_graph(data_pyg, meta, n_nodes):
         stats_array = np.pad(stats_array, (0, N_PROPERTIES - len(stats_array)), constant_values=0.0)
     stats_tensor = torch.from_numpy(stats_array[:N_PROPERTIES].astype(np.float32)).unsqueeze(0)  # [1, N_PROPERTIES]
     
-    # Create simple node features: [degree/max_degree, 1.0] for each node
-    degrees = torch.zeros(n_nodes, dtype=torch.float32)
-    for u, v in data_pyg.edge_index.t().tolist():
-        if u < n_nodes:
-            degrees[u] += 1.0
-        if v < n_nodes:
-            degrees[v] += 1.0
-    max_degree = degrees.max().item() if degrees.max() > 0 else 1.0
-    node_features = torch.stack([degrees / max_degree, torch.ones(n_nodes)], dim=1)  # [n_nodes, 2]
+    # Use node features from Data if available (BFS-ordered with Laplacian eigenvectors)
+    # Otherwise fall back to simple degree features
+    if hasattr(data_pyg, 'x') and data_pyg.x is not None:
+        node_features = data_pyg.x  # [n_nodes, feature_dim] already computed by generator
+    else:
+        # Fallback: Create simple node features: [degree/max_degree, 1.0] for each node
+        degrees = torch.zeros(n_nodes, dtype=torch.float32)
+        for u, v in data_pyg.edge_index.t().tolist():
+            if u < n_nodes:
+                degrees[u] += 1.0
+            if v < n_nodes:
+                degrees[v] += 1.0
+        max_degree = degrees.max().item() if degrees.max() > 0 else 1.0
+        node_features = torch.stack([degrees / max_degree, torch.ones(n_nodes)], dim=1)  # [n_nodes, 2]
     
     # DO NOT pad node features - GNN will process actual nodes, not padded ones
     # Only adjacency matrix needs padding for decoder
@@ -467,7 +347,7 @@ def _prepare_seeded_graph(data_pyg, meta, n_nodes):
     prepared_data = Data(
         edge_index=data_pyg.edge_index,
         y=data_pyg.y,
-        x=node_features,  # Use actual node features (not padded)
+        x=node_features,  # Use node features (BFS-ordered with eigenvectors or degree-based)
         adj=adj_padded,  # Only adj is padded
         stats=stats_tensor,
         num_nodes=n_nodes
@@ -477,8 +357,46 @@ def _prepare_seeded_graph(data_pyg, meta, n_nodes):
 
 
 def _load_seeded_splits(s1_path, s2_path, test_path, n_nodes, test_size, seed, stats_cache_path):
-    """Load splits from seeded generator format (.pt files with (Data, metadata) tuples)."""
+    """Load splits from seeded generator format (.pt files with (Data, metadata) tuples).
+    
+    Uses caching to avoid expensive conversions on repeated runs.
+    """
     print(f"Loading seeded splits for n={n_nodes}...")
+    
+    # Use existing cache directory
+    cache_dir = Path(s1_path).parent / "cache"
+    cache_dir.mkdir(exist_ok=True)
+    
+    cache_key = f"n{n_nodes}_seed{seed}_test{test_size}"
+    s1_cache_path = cache_dir / f"S1_{cache_key}.pt"
+    s2_cache_path = cache_dir / f"S2_{cache_key}.pt"
+    test_cache_path = cache_dir / f"test_{cache_key}.pt"
+    
+    # Try to load from cache
+    if s1_cache_path.exists() and s2_cache_path.exists() and test_cache_path.exists():
+        print(f"  ✅ Loading from processed cache (fast path)...")
+        S1_pool = torch.load(s1_cache_path, map_location='cpu', weights_only=False)
+        S2_pool = torch.load(s2_cache_path, map_location='cpu', weights_only=False)
+        test_graphs = torch.load(test_cache_path, map_location='cpu', weights_only=False)
+        
+        S1_indices = np.arange(len(S1_pool))
+        S2_indices = np.arange(len(S2_pool))
+        test_indices = np.arange(len(test_graphs))
+        
+        print(f"  Loaded S1: {len(S1_pool)}, S2: {len(S2_pool)}, Test: {len(test_graphs)}")
+        
+        return {
+            'S1': S1_pool,
+            'S2': S2_pool,
+            'test_graphs': test_graphs,
+            'test_stats_cache': None,
+            'S1_indices': S1_indices,
+            'S2_indices': S2_indices,
+            'test_indices': test_indices
+        }
+    
+    # Cache miss: load and convert from raw format
+    print(f"  Cache miss - loading and converting raw data (this will be cached for next run)...")
     
     # Load raw data (weights_only=False needed for PyG Data objects)
     S1_raw = torch.load(s1_path, map_location='cpu', weights_only=False)
@@ -489,18 +407,30 @@ def _load_seeded_splits(s1_path, s2_path, test_path, n_nodes, test_size, seed, s
     print(f"  S2: {len(S2_raw)} graphs")
     print(f"  Test: {len(test_raw)} graphs")
     
-    # Convert to pipeline format (with progress bars for large datasets)
+    # Convert to pipeline format with progress tracking
+    from tqdm import tqdm
+    
     print(f"  Converting S1 graphs...")
-    S1_pool = [_prepare_seeded_graph(data, meta, n_nodes) for data, meta in S1_raw]
+    S1_pool = [_prepare_seeded_graph(data, meta, n_nodes) for data, meta in tqdm(S1_raw, desc="S1", disable=len(S1_raw) < 100)]
+    
     print(f"  Converting S2 graphs...")
-    S2_pool = [_prepare_seeded_graph(data, meta, n_nodes) for data, meta in S2_raw]
+    S2_pool = [_prepare_seeded_graph(data, meta, n_nodes) for data, meta in tqdm(S2_raw, desc="S2", disable=len(S2_raw) < 100)]
+    
     print(f"  Converting test graphs...")
-    test_graphs = [_prepare_seeded_graph(data, meta, n_nodes) for data, meta in test_raw]
+    test_graphs = [_prepare_seeded_graph(data, meta, n_nodes) for data, meta in tqdm(test_raw, desc="Test", disable=len(test_raw) < 100)]
     
     # Synthetic indices
     S1_indices = np.arange(len(S1_pool))
     S2_indices = np.arange(len(S2_pool))
     test_indices = np.arange(len(test_graphs))
+    
+    # Save to cache for next run
+    print(f"  💾 Saving processed data to cache for faster future loading...")
+    torch.save(S1_pool, s1_cache_path)
+    torch.save(S2_pool, s2_cache_path)
+    torch.save(test_graphs, test_cache_path)
+    print(f"  ✅ Cache saved to {cache_dir}")
+
     
     # Build/Load test conditioning stats cache
     test_stats_cache = None
@@ -698,60 +628,24 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
     # Generate and evaluate
     print(f"\n--- Generating & Evaluating ---")
     generalization_scores = []  # Gen1 vs Gen2 (WL degree-only)
-    generalization_scores_feat = []  # Gen1 vs Gen2 (WL degree-feature, 5 iters)
-    gen_embed_sims = []         # Gen1 vs Gen2 (cosine in GIN embedding)
-    # Robust memorization across all generated samples (symmetric): Gen1↔S1 and Gen2↔S2
+    # Memorization across all generated samples (symmetric): Gen1↔S1 and Gen2↔S2
     memorization_scores_gen1 = []    # Gen1 vs closest S1 training (WL deg-only)
     memorization_scores_gen2 = []    # Gen2 vs closest S2 training (WL deg-only)
-    memorization_scores_gen1_feat = []  # Gen1 vs closest S1 training (WL deg-feature)
-    memorization_scores_gen2_feat = []  # Gen2 vs closest S2 training (WL deg-feature)
-    mem_embed_sims_gen1 = []         # Gen1 vs nearest S1 (cosine in embedding)
-    mem_embed_sims_gen2 = []         # Gen2 vs nearest S2 (cosine in embedding)
     empty_gen1_count = 0
     empty_gen2_count = 0
     
-    # Precompute S1 training graphs for memorization check
-    S1_training_graphs_nx = []
-    for data in S1:
-        # Create adjacency matrix from edge_index if A doesn't exist
-        if hasattr(data, 'A') and data.A is not None:
-            adj = data.A[0].cpu().numpy()
-        else:
-            # Construct from edge_index (sparse representation)
-            n_nodes = data.num_nodes
-            adj = np.zeros((n_nodes, n_nodes))
-            if data.edge_index.numel() > 0:
-                edge_index = data.edge_index.cpu().numpy()
-                adj[edge_index[0], edge_index[1]] = 1.0
-        
-        features = data.x.detach().cpu().numpy() if hasattr(data, 'x') else None
-        G_train = construct_nx_from_adj(adj, node_features=features)
-        S1_training_graphs_nx.append(G_train)
+    # Memory-efficient: Keep training data in PyG format, convert on-the-fly
+    # Only precompute lightweight degree histograms for kNN prefilter
+    print(f"Preparing {len(S1)} training graphs for memorization check (on-the-fly conversion)")
     
-    print(f"Constructed {len(S1_training_graphs_nx)} training graphs for memorization check")
-    print(f"Sample training graph: {S1_training_graphs_nx[0].number_of_nodes()} nodes, {S1_training_graphs_nx[0].number_of_edges()} edges")
-    
-    # Precompute S2 training graphs for closest-match visualization (mirror of S1)
-    S2_training_graphs_nx = []
-    for data in S2:
-        if hasattr(data, 'A') and data.A is not None:
-            adj = data.A[0].cpu().numpy()
-        else:
-            n_nodes = data.num_nodes
-            adj = np.zeros((n_nodes, n_nodes))
-            if data.edge_index.numel() > 0:
-                edge_index = data.edge_index.cpu().numpy()
-                adj[edge_index[0], edge_index[1]] = 1.0
-        features = data.x.detach().cpu().numpy() if hasattr(data, 'x') else None
-        G_train = construct_nx_from_adj(adj, node_features=features)
-        S2_training_graphs_nx.append(G_train)
-
-    # Precompute degree histograms for kNN prefilter
+    # Precompute degree histograms for kNN prefilter (lightweight)
     n_bins = n_nodes  # degrees in [0, n-1]
-    S1_degree_hists = _precompute_degree_hists(S1_training_graphs_nx, n_bins)
-    S2_degree_hists = _precompute_degree_hists(S2_training_graphs_nx, n_bins)
+    S1_degree_hists = _precompute_degree_hists_from_pyg(S1, n_bins)
+    S2_degree_hists = _precompute_degree_hists_from_pyg(S2, n_bins)
     
-    # Prepare to accumulate generated graphs for embedding-based metrics
+    print(f"Precomputed degree histograms for {len(S1)} S1 + {len(S2)} S2 graphs")
+    
+    # Prepare to accumulate generated graphs
     all_gen1_graphs = []
     all_gen2_graphs = []
 
@@ -791,86 +685,42 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
             # Degree-only WL similarity between Gen1 and Gen2 samples
             sim = wl_similarity_degree_only(g1, g2)
             generalization_scores.append(sim)
-            # Degree-feature WL similarity (5 iterations)
-            sim_feat = wl_similarity_degree_feature(g1, g2, n_iter=5)
-            generalization_scores_feat.append(sim_feat)
             
             # Debug first few
             if i == 0 and sample_idx < 2:
-                print(f"  Gen1 vs Gen2 sample {sample_idx}: WL(degree-only) = {sim:.4f} | WL(deg-feature,5) = {sim_feat:.4f}")
+                print(f"  Gen1 vs Gen2 sample {sample_idx}: WL(degree-only) = {sim:.4f}")
         
-        # Robust memorization with k-NN prefilter on degree histograms (WL)
+        # Memorization with k-NN prefilter on degree histograms (WL degree-only)
         # Gen1 vs S1
         for g in G1_samples:
-            _, sim_g1 = find_closest_graph_in_training_degree_only_k(g, S1_training_graphs_nx, S1_degree_hists, n_bins, K_NEAREST)
+            _, sim_g1 = find_closest_graph_in_training_degree_only_k(g, S1, S1_degree_hists, n_bins, K_NEAREST)
             memorization_scores_gen1.append(sim_g1)
-            _, sim_g1f = find_closest_graph_in_training_feature_k(g, S1_training_graphs_nx, S1_degree_hists, n_bins, K_NEAREST)
-            memorization_scores_gen1_feat.append(sim_g1f)
         # Gen2 vs S2 (symmetric)
         for g in G2_samples:
-            _, sim_g2 = find_closest_graph_in_training_degree_only_k(g, S2_training_graphs_nx, S2_degree_hists, n_bins, K_NEAREST)
+            _, sim_g2 = find_closest_graph_in_training_degree_only_k(g, S2, S2_degree_hists, n_bins, K_NEAREST)
             memorization_scores_gen2.append(sim_g2)
-            _, sim_g2f = find_closest_graph_in_training_feature_k(g, S2_training_graphs_nx, S2_degree_hists, n_bins, K_NEAREST)
-            memorization_scores_gen2_feat.append(sim_g2f)
         
         # Debug: Print first few to check
         if i < 2:
             # Check node attributes safely
             gen_has_feat = False
-            train_has_feat = False
             
             if G1_samples[0].number_of_nodes() > 0:
                 first_node = list(G1_samples[0].nodes())[0]
                 gen_has_feat = 'feature_vector' in G1_samples[0].nodes[first_node]
             # Print a quick nearest-neighbor sim snapshot for context
-            dbg_closest, dbg_sim = find_closest_graph_in_training_degree_only_k(G1_samples[0], S1_training_graphs_nx, S1_degree_hists, n_bins, min(10, K_NEAREST))
-            dbg_closest_f, dbg_sim_f = find_closest_graph_in_training_feature_k(G1_samples[0], S1_training_graphs_nx, S1_degree_hists, n_bins, min(10, K_NEAREST))
+            dbg_closest, dbg_sim = find_closest_graph_in_training_degree_only_k(G1_samples[0], S1, S1_degree_hists, n_bins, min(10, K_NEAREST))
             if dbg_closest is not None:
                 print(f"  Test {i}: Gen1 sample0 ({G1_samples[0].number_of_nodes()}n, {G1_samples[0].number_of_edges()}e, has_feat={gen_has_feat}) "
-                      f"vs closest S1 WLdeg={dbg_sim:.4f} | WLfeat={dbg_sim_f:.4f}")
+                      f"vs closest S1 WLdeg={dbg_sim:.4f}")
             # Manual degree-only WL test between first gen and first train
-            if i == 0 and len(S1_training_graphs_nx) > 0:
-                test_sim = wl_similarity_degree_only(G1_samples[0], S1_training_graphs_nx[0])
+            if i == 0 and len(S1) > 0:
+                test_sim = wl_similarity_degree_only(G1_samples[0], _pyg_to_nx(S1[0]))
                 print(f"  Direct WL test (degree-only) Gen1 vs first S1: {test_sim:.4f}")
     
-    # Build untrained GIN embedding and compute cosine-based metrics
-    embed_model = _RandomGIN(in_dim=2, hidden=64, out_dim=64, layers=3, seed=1234)
-    # Embed training sets once
-    E_S1 = _embed_graphs(embed_model, S1_training_graphs_nx)
-    E_S2 = _embed_graphs(embed_model, S2_training_graphs_nx)
-    # Embed all generated graphs
-    E_G1 = _embed_graphs(embed_model, all_gen1_graphs)
-    E_G2 = _embed_graphs(embed_model, all_gen2_graphs)
-
-    # 1) Generalization (Gen1 vs Gen2) cosine for paired samples
-    m = min(E_G1.shape[0], E_G2.shape[0])
-    if m > 0:
-        # Normalize then row-wise dot for pairs
-        G1n = E_G1[:m] / (np.linalg.norm(E_G1[:m], axis=1, keepdims=True) + 1e-9)
-        G2n = E_G2[:m] / (np.linalg.norm(E_G2[:m], axis=1, keepdims=True) + 1e-9)
-        pair_cos = np.sum(G1n * G2n, axis=1)
-        gen_embed_sims = pair_cos.tolist()
-
-    # 2) Memorization (nearest training cosine in embedding space)
-    mem_knn_k = 5
-    # Gen1 -> S1
-    if E_G1.shape[0] > 0 and E_S1.shape[0] > 0:
-        C1 = _cosine_matrix(E_G1, E_S1)
-        # Use mean of top-k neighbors (less saturating than pure max)
-        k = min(mem_knn_k, C1.shape[1])
-        topk1 = np.partition(C1, -k, axis=1)[:, -k:]
-        mem_embed_sims_gen1 = np.mean(topk1, axis=1).tolist()
-    # Gen2 -> S2
-    if E_G2.shape[0] > 0 and E_S2.shape[0] > 0:
-        C2 = _cosine_matrix(E_G2, E_S2)
-        k = min(mem_knn_k, C2.shape[1])
-        topk2 = np.partition(C2, -k, axis=1)[:, -k:]
-        mem_embed_sims_gen2 = np.mean(topk2, axis=1).tolist()
-
     gen_mean = np.mean(generalization_scores) if len(generalization_scores) > 0 else np.nan
     # Combine symmetric memorization scores for reporting/plots
     memorization_scores = memorization_scores_gen1 + memorization_scores_gen2
-    memorization_scores_feat = memorization_scores_gen1_feat + memorization_scores_gen2_feat
     mem_mean = np.mean(memorization_scores) if len(memorization_scores) > 0 else np.nan
     
     # Calculate empty graph statistics
@@ -881,84 +731,7 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
     
     print(f"\nResults:")
     print(f"  Generalization (Gen1 vs Gen2) [WL deg-only]: {gen_mean:.4f} ± {np.std(generalization_scores):.4f}")
-    if len(generalization_scores_feat) > 0:
-        print(f"  Generalization (Gen1 vs Gen2) [WL deg-feature, iters=5]: {np.mean(generalization_scores_feat):.4f} ± {np.std(generalization_scores_feat):.4f}")
     print(f"  Memorization (symmetric) [WL deg-only]:      {mem_mean:.4f} ± {np.std(memorization_scores):.4f}")
-    if len(memorization_scores_feat) > 0:
-        print(f"  Memorization (symmetric) [WL deg-feature]:   {np.mean(memorization_scores_feat):.4f} ± {np.std(memorization_scores_feat):.4f}")
-    # Embedding metrics summary
-    if len(gen_embed_sims) > 0:
-        print(f"  [Emb] Gen1↔Gen2 cosine:       {np.mean(gen_embed_sims):.4f} ± {np.std(gen_embed_sims):.4f}")
-    if len(mem_embed_sims_gen1) > 0:
-        print(f"  [Emb] Gen1↔S1 (top-{mem_knn_k}) cos: {np.mean(mem_embed_sims_gen1):.4f} ± {np.std(mem_embed_sims_gen1):.4f}")
-    if len(mem_embed_sims_gen2) > 0:
-        print(f"  [Emb] Gen2↔S2 (top-{mem_knn_k}) cos: {np.mean(mem_embed_sims_gen2):.4f} ± {np.std(mem_embed_sims_gen2):.4f}")
-
-    # Set-level distances (FID / MMD) - optional print for clarity
-    embed_set_metrics = None
-    if E_G1.shape[0] > 1 and E_G2.shape[0] > 1 and E_S1.shape[0] > 1 and E_S2.shape[0] > 1:
-        embed_set_metrics = {
-            'fid': {
-                'G1_S1': _compute_fid(E_G1, E_S1),
-                'G1_S2': _compute_fid(E_G1, E_S2),
-                'G2_S2': _compute_fid(E_G2, E_S2),
-                'G2_S1': _compute_fid(E_G2, E_S1),
-                'G1_G2': _compute_fid(E_G1, E_G2),
-            },
-            'mmd': {
-                'G1_S1': _compute_mmd_rbf(E_G1, E_S1),
-                'G1_S2': _compute_mmd_rbf(E_G1, E_S2),
-                'G2_S2': _compute_mmd_rbf(E_G2, E_S2),
-                'G2_S1': _compute_mmd_rbf(E_G2, E_S1),
-                'G1_G2': _compute_mmd_rbf(E_G1, E_G2),
-            }
-        }
-        print("  [Emb] Set distances (FID | MMD-RBF):")
-        print(f"       G1↔S1: {embed_set_metrics['fid']['G1_S1']:.6f} | {embed_set_metrics['mmd']['G1_S1']:.6f}    G1↔S2: {embed_set_metrics['fid']['G1_S2']:.6f} | {embed_set_metrics['mmd']['G1_S2']:.6f}")
-        print(f"       G2↔S2: {embed_set_metrics['fid']['G2_S2']:.6f} | {embed_set_metrics['mmd']['G2_S2']:.6f}    G2↔S1: {embed_set_metrics['fid']['G2_S1']:.6f} | {embed_set_metrics['mmd']['G2_S1']:.6f}")
-        print(f"       G1↔G2: {embed_set_metrics['fid']['G1_G2']:.6f} | {embed_set_metrics['mmd']['G1_G2']:.6f}")
-
-        # Save per-n text file with these values
-        with open(exp_dir / 'embed_set_metrics.txt', 'w') as ef:
-            ef.write('Pair,FID,MMD_RBF\n')
-            for pair in ['G1_S1','G1_S2','G2_S2','G2_S1','G1_G2']:
-                ef.write(f"{pair},{embed_set_metrics['fid'][pair]:.6f},{embed_set_metrics['mmd'][pair]:.6f}\n")
-
-        # Create simple bar plots for FID and MMD showing Gen1↔Gen2 vs chosen Mem (whichever separates more)
-        def _pick_mem_pair(metrics_dict):
-            # choose between G1_S1 and G2_S2 for larger separation from G1_G2
-            gen = metrics_dict['G1_G2']
-            cand = []
-            cand.append((abs(metrics_dict['G1_S1'] - gen), 'G1_S1'))
-            cand.append((abs(metrics_dict['G2_S2'] - gen), 'G2_S2'))
-            cand.sort(key=lambda x: x[0], reverse=True)
-            return cand[0][1]
-
-        fid_mem_pair = _pick_mem_pair(embed_set_metrics['fid'])
-        mmd_mem_pair = _pick_mem_pair(embed_set_metrics['mmd'])
-
-        fig, axs = plt.subplots(1, 2, figsize=(10, 5))
-        # FID
-        axs[0].bar([0, 1], [embed_set_metrics['fid']['G1_G2'], embed_set_metrics['fid'][fid_mem_pair]], color=['blue','orange'], edgecolor='black')
-        axs[0].set_xticks([0, 1])
-        axs[0].set_xticklabels(['Gen1 vs Gen2', 'Gen vs Train'])
-        axs[0].set_ylabel('FID', fontsize=25)
-        axs[0].tick_params(axis='both', labelsize=14)
-        # MMD
-        axs[1].bar([0, 1], [embed_set_metrics['mmd']['G1_G2'], embed_set_metrics['mmd'][mmd_mem_pair]], color=['blue','orange'], edgecolor='black')
-        axs[1].set_xticks([0, 1])
-        axs[1].set_xticklabels(['Gen1 vs Gen2', 'Gen vs Train'])
-        axs[1].set_ylabel('MMD-RBF', fontsize=25)
-        axs[1].tick_params(axis='both', labelsize=14)
-        for ax in axs:
-            # No title per style; ensure large x-labels are readable
-            for label in ax.get_xticklabels():
-                label.set_fontsize(16)
-        fig_dir = output_dir / 'figures'
-        fig_dir.mkdir(exist_ok=True)
-        plt.tight_layout()
-        plt.savefig(fig_dir / f'embed_set_metrics_n{n_nodes}.png', dpi=300, bbox_inches='tight')
-        plt.close()
     print(f"\n  [WARNING] Empty Graph Statistics:")
     print(f"    Gen1 empty: {empty_gen1_count}/{total_gen1_graphs} ({empty_gen1_pct:.1f}%)")
     print(f"    Gen2 empty: {empty_gen2_count}/{total_gen2_graphs} ({empty_gen2_pct:.1f}%)")
@@ -978,60 +751,30 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
     closest_s1_for_gen1 = []
     closest_s1_sims = []
     for G in example_gen1:
-        G_closest, sim = find_closest_graph_in_training_degree_only_k(G, S1_training_graphs_nx, S1_degree_hists, n_bins, K_NEAREST)
+        G_closest, sim = find_closest_graph_in_training_degree_only_k(G, S1, S1_degree_hists, n_bins, K_NEAREST)
         closest_s1_for_gen1.append(G_closest)
         closest_s1_sims.append(sim)
     
     closest_s2_for_gen2 = []
     closest_s2_sims = []
     for G in example_gen2:
-        G_closest, sim = find_closest_graph_in_training_degree_only_k(G, S2_training_graphs_nx, S2_degree_hists, n_bins, K_NEAREST)
+        G_closest, sim = find_closest_graph_in_training_degree_only_k(G, S2, S2_degree_hists, n_bins, K_NEAREST)
         closest_s2_for_gen2.append(G_closest)
         closest_s2_sims.append(sim)
     
     # Example subsets from training (fallback/reference)
     # Fallback example slices (safe indexing)
-    if len(S1_training_graphs_nx) > 0:
-        idxs_s1 = [0, min(10, len(S1_training_graphs_nx)-1), min(20, len(S1_training_graphs_nx)-1)]
-        example_s1 = [S1_training_graphs_nx[i] for i in idxs_s1]
+    if len(S1) > 0:
+        idxs_s1 = [0, min(10, len(S1)-1), min(20, len(S1)-1)]
+        example_s1 = [_pyg_to_nx(S1[i]) for i in idxs_s1]
     else:
         example_s1 = []
-    if len(S2_training_graphs_nx) > 0:
-        idxs_s2 = [0, min(10, len(S2_training_graphs_nx)-1), min(20, len(S2_training_graphs_nx)-1)]
-        example_s2_graphs = [S2_training_graphs_nx[i] for i in idxs_s2]
+    if len(S2) > 0:
+        idxs_s2 = [0, min(10, len(S2)-1), min(20, len(S2)-1)]
+        example_s2_graphs = [_pyg_to_nx(S2[i]) for i in idxs_s2]
     else:
         example_s2_graphs = []
     
-    # Decide which memorization comparator to plot against Gen↔Gen for nicer separation
-    chosen_mem_label = None
-    chosen_mem_sims = None
-    if len(gen_embed_sims) > 0:
-        mean_gen = float(np.mean(gen_embed_sims))
-        cand = []
-        if len(mem_embed_sims_gen1) > 0:
-            cand.append((abs(float(np.mean(mem_embed_sims_gen1)) - mean_gen), 'Gen1_vs_S1', mem_embed_sims_gen1))
-        if len(mem_embed_sims_gen2) > 0:
-            cand.append((abs(float(np.mean(mem_embed_sims_gen2)) - mean_gen), 'Gen2_vs_S2', mem_embed_sims_gen2))
-        if len(cand) > 0:
-            cand.sort(key=lambda x: x[0], reverse=True)
-            _, chosen_mem_label, chosen_mem_sims = cand[0]
-
-            # Plot simple histogram: Gen1↔Gen2 vs chosen memorization comparator (cosine)
-            fig, ax = plt.subplots(figsize=(6, 5))
-            bins = np.linspace(-1, 1, 41)
-            ax.hist(gen_embed_sims, bins=bins, alpha=0.5, color='blue', density=True, edgecolor='black', label='Gen1 vs Gen2')
-            ax.hist(chosen_mem_sims, bins=bins, alpha=0.5, color='orange', density=True, edgecolor='black', label=('Gen1 vs S1' if chosen_mem_label=='Gen1_vs_S1' else 'Gen2 vs S2'))
-            ax.set_xlabel('Cosine similarity', fontsize=25)
-            ax.set_ylabel('Density', fontsize=25)
-            ax.tick_params(axis='both', labelsize=14)
-            ax.set_xlim(-1.0, 1.0)
-            ax.legend(fontsize=12, loc='upper left')
-            fig_dir = output_dir / 'figures'
-            fig_dir.mkdir(exist_ok=True)
-            plt.tight_layout()
-            plt.savefig(fig_dir / f'embed_hist_mem_vs_gen_n{n_nodes}.png', dpi=300, bbox_inches='tight')
-            plt.close()
-
     return {
         'n_nodes': n_nodes,
         'N': N,
@@ -1042,17 +785,12 @@ def run_experiment_for_n(n_nodes, split_config, output_dir):
         'dn_gen1_metrics': dn_gen1_metrics,
         'dn_gen2_metrics': dn_gen2_metrics,
         'generalization_scores': generalization_scores,
-        'generalization_scores_feat': generalization_scores_feat,
-        'gen_embed_sims': gen_embed_sims,
-        'mem_embed_sims_gen1': mem_embed_sims_gen1,
-        'mem_embed_sims_gen2': mem_embed_sims_gen2,
-    'chosen_mem_label': chosen_mem_label,
-    'embed_set_metrics': embed_set_metrics,
-    # Distributions for plots and logs
-    'memorization_scores': memorization_scores,
-    'memorization_scores_feat': memorization_scores_feat,
-    'memorization_scores_gen1': memorization_scores_gen1,
-    'memorization_scores_gen2': memorization_scores_gen2,
+        'memorization_scores_gen1': memorization_scores_gen1,
+        'memorization_scores_gen2': memorization_scores_gen2,
+        # Distributions for plots and logs
+        'memorization_scores': memorization_scores,
+        'memorization_scores_gen1': memorization_scores_gen1,
+        'memorization_scores_gen2': memorization_scores_gen2,
         'distribution_summary': distribution_summary,
         'example_gen1': example_gen1,
         'example_gen2': example_gen2,
@@ -1074,6 +812,28 @@ def visualize_example_graphs_single(result, n_nodes, output_dir):
     fig_dir = output_dir / "figures"
     fig_dir.mkdir(exist_ok=True)
     
+    # Adaptive node size and edge width based on graph size
+    if n_nodes <= 50:
+        node_size = 200
+        edge_width = 1.5
+        layout_k = None
+        layout_iterations = 50
+    elif n_nodes <= 100:
+        node_size = 100
+        edge_width = 1.0
+        layout_k = None
+        layout_iterations = 50
+    elif n_nodes <= 300:
+        node_size = 20
+        edge_width = 0.3
+        layout_k = 0.3
+        layout_iterations = 30
+    else:  # Large graphs (600+)
+        node_size = 3
+        edge_width = 0.1
+        layout_k = 0.5
+        layout_iterations = 30
+    
     # Create 4x3 grid: 4 sources (Gen1, Closest S1, Gen2, Closest S2) x 3 examples each
     fig, axes = plt.subplots(4, 3, figsize=(15, 18))
     
@@ -1094,15 +854,15 @@ def visualize_example_graphs_single(result, n_nodes, output_dir):
                 # Layout
                 if G.number_of_nodes() > 0:
                     try:
-                        pos = nx.spring_layout(G, seed=42, k=1/np.sqrt(G.number_of_nodes()))
+                        pos = nx.spring_layout(G, seed=42, k=layout_k, iterations=layout_iterations)
                     except:
                         pos = nx.spring_layout(G, seed=42)
                     
-                    # Draw
+                    # Draw with adaptive sizing
                     nx.draw_networkx_nodes(G, pos, ax=ax, node_color=color, 
-                                          node_size=200, alpha=0.8, edgecolors='black', linewidths=1)
+                                          node_size=node_size, alpha=0.7, edgecolors='black', linewidths=0.5)
                     nx.draw_networkx_edges(G, pos, ax=ax, edge_color='gray', 
-                                          width=1.5, alpha=0.6)
+                                          width=edge_width, alpha=0.5)
                     
                     # Info
                     info_text = f"{G.number_of_nodes()}n, {G.number_of_edges()}e"
@@ -1144,6 +904,28 @@ def visualize_example_graphs(all_results, output_dir):
         
         result = all_results[n_nodes]
         
+        # Adaptive node size and edge width based on graph size
+        if n_nodes <= 50:
+            node_size = 200
+            edge_width = 1.5
+            layout_k = None
+            layout_iterations = 50
+        elif n_nodes <= 100:
+            node_size = 100
+            edge_width = 1.0
+            layout_k = None
+            layout_iterations = 50
+        elif n_nodes <= 300:
+            node_size = 20
+            edge_width = 0.3
+            layout_k = 0.3
+            layout_iterations = 30
+        else:  # Large graphs (600+)
+            node_size = 3
+            edge_width = 0.1
+            layout_k = 0.5
+            layout_iterations = 30
+        
         # Create 4x3 grid: 4 sources (Gen1, Closest S1, Gen2, Closest S2) x 3 examples each
         fig, axes = plt.subplots(4, 3, figsize=(15, 18))
         
@@ -1164,15 +946,15 @@ def visualize_example_graphs(all_results, output_dir):
                     # Layout
                     if G.number_of_nodes() > 0:
                         try:
-                            pos = nx.spring_layout(G, seed=42, k=1/np.sqrt(G.number_of_nodes()))
+                            pos = nx.spring_layout(G, seed=42, k=layout_k, iterations=layout_iterations)
                         except:
                             pos = nx.spring_layout(G, seed=42)
                         
-                        # Draw
+                        # Draw with adaptive sizing
                         nx.draw_networkx_nodes(G, pos, ax=ax, node_color=color, 
-                                              node_size=200, alpha=0.8, edgecolors='black', linewidths=1)
+                                              node_size=node_size, alpha=0.7, edgecolors='black', linewidths=0.5)
                         nx.draw_networkx_edges(G, pos, ax=ax, edge_color='gray', 
-                                              width=1.5, alpha=0.6)
+                                              width=edge_width, alpha=0.5)
                         
                         # Info
                         info_text = f"{G.number_of_nodes()}n, {G.number_of_edges()}e"
@@ -1198,167 +980,167 @@ def visualize_example_graphs(all_results, output_dir):
     plt.close()
 
 
-def visualize_gt_vs_generated_single(result, n_nodes, output_dir):
-    """
-    Create GT vs Generated visualization for a single n value immediately after training.
-    """
-    print(f"  Creating GT vs Generated for n={n_nodes}...")
+# def visualize_gt_vs_generated_single(result, n_nodes, output_dir):
+#     """
+#     Create GT vs Generated visualization for a single n value immediately after training.
+#     """
+#     print(f"  Creating GT vs Generated for n={n_nodes}...")
     
-    fig_dir = output_dir / "figures"
-    fig_dir.mkdir(exist_ok=True)
+#     fig_dir = output_dir / "figures"
+#     fig_dir.mkdir(exist_ok=True)
     
-    # Create 2 rows x 6 columns: Top row = GT (S1), Bottom row = Generated (Gen1)
-    fig, axes = plt.subplots(2, 6, figsize=(24, 8))
+#     # Create 2 rows x 6 columns: Top row = GT (S1), Bottom row = Generated (Gen1)
+#     fig, axes = plt.subplots(2, 6, figsize=(24, 8))
     
-    # Get GT and Generated graphs
-    gt_graphs = result['example_s1'][:6]  # Up to 6 GT examples
-    gen_graphs = result['example_gen1'][:6]  # Up to 6 Generated examples
+#     # Get GT and Generated graphs
+#     gt_graphs = result['example_s1'][:6]  # Up to 6 GT examples
+#     gen_graphs = result['example_gen1'][:6]  # Up to 6 Generated examples
     
-    # Top row: Ground Truth (Training Data)
-    for col_idx in range(6):
-        ax = axes[0, col_idx]
+#     # Top row: Ground Truth (Training Data)
+#     for col_idx in range(6):
+#         ax = axes[0, col_idx]
         
-        if col_idx < len(gt_graphs):
-            G = gt_graphs[col_idx]
+#         if col_idx < len(gt_graphs):
+#             G = gt_graphs[col_idx]
             
-            if G.number_of_nodes() > 0:
-                try:
-                    pos = nx.spring_layout(G, seed=42+col_idx, k=1/np.sqrt(G.number_of_nodes()))
-                except:
-                    pos = nx.spring_layout(G, seed=42+col_idx)
+#             if G.number_of_nodes() > 0:
+#                 try:
+#                     pos = nx.spring_layout(G, seed=42+col_idx, k=1/np.sqrt(G.number_of_nodes()))
+#                 except:
+#                     pos = nx.spring_layout(G, seed=42+col_idx)
                 
-                nx.draw_networkx_nodes(G, pos, ax=ax, node_color='#2ecc71', 
-                                      node_size=300, alpha=0.8, edgecolors='black', linewidths=1.5)
-                nx.draw_networkx_edges(G, pos, ax=ax, edge_color='gray', 
-                                      width=2, alpha=0.7)
+#                 nx.draw_networkx_nodes(G, pos, ax=ax, node_color='#2ecc71', 
+#                                       node_size=300, alpha=0.8, edgecolors='black', linewidths=1.5)
+#                 nx.draw_networkx_edges(G, pos, ax=ax, edge_color='gray', 
+#                                       width=2, alpha=0.7)
                 
-                info_text = f"{G.number_of_nodes()}n, {G.number_of_edges()}e"
-                ax.text(0.5, -0.1, info_text, transform=ax.transAxes,
-                       ha='center', fontsize=14, fontweight='bold')
+#                 info_text = f"{G.number_of_nodes()}n, {G.number_of_edges()}e"
+#                 ax.text(0.5, -0.1, info_text, transform=ax.transAxes,
+#                        ha='center', fontsize=14, fontweight='bold')
         
-        ax.set_axis_off()
-        if col_idx == 0:
-            ax.text(-0.2, 0.5, 'Ground Truth\n(Training)', transform=ax.transAxes,
-                   ha='right', va='center', fontsize=16, fontweight='bold', color='#2ecc71')
+#         ax.set_axis_off()
+#         if col_idx == 0:
+#             ax.text(-0.2, 0.5, 'Ground Truth\n(Training)', transform=ax.transAxes,
+#                    ha='right', va='center', fontsize=16, fontweight='bold', color='#2ecc71')
     
-    # Bottom row: Generated graphs
-    for col_idx in range(6):
-        ax = axes[1, col_idx]
+#     # Bottom row: Generated graphs
+#     for col_idx in range(6):
+#         ax = axes[1, col_idx]
         
-        if col_idx < len(gen_graphs):
-            G = gen_graphs[col_idx]
+#         if col_idx < len(gen_graphs):
+#             G = gen_graphs[col_idx]
             
-            if G.number_of_nodes() > 0:
-                try:
-                    pos = nx.spring_layout(G, seed=42+col_idx, k=1/np.sqrt(G.number_of_nodes()))
-                except:
-                    pos = nx.spring_layout(G, seed=42+col_idx)
+#             if G.number_of_nodes() > 0:
+#                 try:
+#                     pos = nx.spring_layout(G, seed=42+col_idx, k=1/np.sqrt(G.number_of_nodes()))
+#                 except:
+#                     pos = nx.spring_layout(G, seed=42+col_idx)
                 
-                nx.draw_networkx_nodes(G, pos, ax=ax, node_color='#3498db', 
-                                      node_size=300, alpha=0.8, edgecolors='black', linewidths=1.5)
-                nx.draw_networkx_edges(G, pos, ax=ax, edge_color='gray', 
-                                      width=2, alpha=0.7)
+#                 nx.draw_networkx_nodes(G, pos, ax=ax, node_color='#3498db', 
+#                                       node_size=300, alpha=0.8, edgecolors='black', linewidths=1.5)
+#                 nx.draw_networkx_edges(G, pos, ax=ax, edge_color='gray', 
+#                                       width=2, alpha=0.7)
                 
-                info_text = f"{G.number_of_nodes()}n, {G.number_of_edges()}e"
-                ax.text(0.5, -0.1, info_text, transform=ax.transAxes,
-                       ha='center', fontsize=14, fontweight='bold')
+#                 info_text = f"{G.number_of_nodes()}n, {G.number_of_edges()}e"
+#                 ax.text(0.5, -0.1, info_text, transform=ax.transAxes,
+#                        ha='center', fontsize=14, fontweight='bold')
         
-        ax.set_axis_off()
-        if col_idx == 0:
-            ax.text(-0.2, 0.5, 'Generated\n(Gen1)', transform=ax.transAxes,
-                   ha='right', va='center', fontsize=16, fontweight='bold', color='#3498db')
+#         ax.set_axis_off()
+#         if col_idx == 0:
+#             ax.text(-0.2, 0.5, 'Generated\n(Gen1)', transform=ax.transAxes,
+#                    ha='right', va='center', fontsize=16, fontweight='bold', color='#3498db')
     
-    fig.suptitle(f'Ground Truth vs Generated Graphs (n={n_nodes} nodes, N={FIXED_N} training examples)', 
-                 fontsize=20, fontweight='bold', y=0.98)
-    plt.tight_layout(rect=[0.05, 0, 1, 0.96])
-    plt.savefig(fig_dir / f'gt_vs_generated_n{n_nodes}.png', dpi=300, bbox_inches='tight')
-    print(f"  Saved: {fig_dir / f'gt_vs_generated_n{n_nodes}.png'}")
-    plt.close()
+#     fig.suptitle(f'Ground Truth vs Generated Graphs (n={n_nodes} nodes, N={FIXED_N} training examples)', 
+#                  fontsize=20, fontweight='bold', y=0.98)
+#     plt.tight_layout(rect=[0.05, 0, 1, 0.96])
+#     plt.savefig(fig_dir / f'gt_vs_generated_n{n_nodes}.png', dpi=300, bbox_inches='tight')
+#     print(f"  Saved: {fig_dir / f'gt_vs_generated_n{n_nodes}.png'}")
+#     plt.close()
 
 
-def visualize_gt_vs_generated(all_results, output_dir):
-    """
-    Create side-by-side comparison of Ground Truth (training) vs Generated graphs for each n.
-    This helps understand if models are truly memorizing or learning the distribution.
-    """
-    print(f"\n--- Creating GT vs Generated comparison visualizations ---")
+# def visualize_gt_vs_generated(all_results, output_dir):
+#     """
+#     Create side-by-side comparison of Ground Truth (training) vs Generated graphs for each n.
+#     This helps understand if models are truly memorizing or learning the distribution.
+#     """
+#     print(f"\n--- Creating GT vs Generated comparison visualizations ---")
     
-    fig_dir = output_dir / "figures"
-    fig_dir.mkdir(exist_ok=True)
+#     fig_dir = output_dir / "figures"
+#     fig_dir.mkdir(exist_ok=True)
     
-    for n_nodes in NODE_SIZES:
-        if n_nodes not in all_results:
-            continue
+#     for n_nodes in NODE_SIZES:
+#         if n_nodes not in all_results:
+#             continue
         
-        result = all_results[n_nodes]
+#         result = all_results[n_nodes]
         
-        # Create 2 rows x 6 columns: Top row = GT (S1), Bottom row = Generated (Gen1)
-        fig, axes = plt.subplots(2, 6, figsize=(24, 8))
+#         # Create 2 rows x 6 columns: Top row = GT (S1), Bottom row = Generated (Gen1)
+#         fig, axes = plt.subplots(2, 6, figsize=(24, 8))
         
-        # Get GT and Generated graphs
-        gt_graphs = result['example_s1'][:6]  # Up to 6 GT examples
-        gen_graphs = result['example_gen1'][:6]  # Up to 6 Generated examples
+#         # Get GT and Generated graphs
+#         gt_graphs = result['example_s1'][:6]  # Up to 6 GT examples
+#         gen_graphs = result['example_gen1'][:6]  # Up to 6 Generated examples
         
-        # Top row: Ground Truth (Training Data)
-        for col_idx in range(6):
-            ax = axes[0, col_idx]
+#         # Top row: Ground Truth (Training Data)
+#         for col_idx in range(6):
+#             ax = axes[0, col_idx]
             
-            if col_idx < len(gt_graphs):
-                G = gt_graphs[col_idx]
+#             if col_idx < len(gt_graphs):
+#                 G = gt_graphs[col_idx]
                 
-                if G.number_of_nodes() > 0:
-                    try:
-                        pos = nx.spring_layout(G, seed=42+col_idx, k=1/np.sqrt(G.number_of_nodes()))
-                    except:
-                        pos = nx.spring_layout(G, seed=42+col_idx)
+#                 if G.number_of_nodes() > 0:
+#                     try:
+#                         pos = nx.spring_layout(G, seed=42+col_idx, k=1/np.sqrt(G.number_of_nodes()))
+#                     except:
+#                         pos = nx.spring_layout(G, seed=42+col_idx)
                     
-                    nx.draw_networkx_nodes(G, pos, ax=ax, node_color='#2ecc71', 
-                                          node_size=300, alpha=0.8, edgecolors='black', linewidths=1.5)
-                    nx.draw_networkx_edges(G, pos, ax=ax, edge_color='gray', 
-                                          width=2, alpha=0.7)
+#                     nx.draw_networkx_nodes(G, pos, ax=ax, node_color='#2ecc71', 
+#                                           node_size=300, alpha=0.8, edgecolors='black', linewidths=1.5)
+#                     nx.draw_networkx_edges(G, pos, ax=ax, edge_color='gray', 
+#                                           width=2, alpha=0.7)
                     
-                    info_text = f"{G.number_of_nodes()}n, {G.number_of_edges()}e"
-                    ax.text(0.5, -0.1, info_text, transform=ax.transAxes,
-                           ha='center', fontsize=14, fontweight='bold')
+#                     info_text = f"{G.number_of_nodes()}n, {G.number_of_edges()}e"
+#                     ax.text(0.5, -0.1, info_text, transform=ax.transAxes,
+#                            ha='center', fontsize=14, fontweight='bold')
             
-            ax.set_axis_off()
-            if col_idx == 0:
-                ax.text(-0.2, 0.5, 'Ground Truth\n(Training)', transform=ax.transAxes,
-                       ha='right', va='center', fontsize=16, fontweight='bold', color='#2ecc71')
+#             ax.set_axis_off()
+#             if col_idx == 0:
+#                 ax.text(-0.2, 0.5, 'Ground Truth\n(Training)', transform=ax.transAxes,
+#                        ha='right', va='center', fontsize=16, fontweight='bold', color='#2ecc71')
         
-        # Bottom row: Generated graphs
-        for col_idx in range(6):
-            ax = axes[1, col_idx]
+#         # Bottom row: Generated graphs
+#         for col_idx in range(6):
+#             ax = axes[1, col_idx]
             
-            if col_idx < len(gen_graphs):
-                G = gen_graphs[col_idx]
+#             if col_idx < len(gen_graphs):
+#                 G = gen_graphs[col_idx]
                 
-                if G.number_of_nodes() > 0:
-                    try:
-                        pos = nx.spring_layout(G, seed=42+col_idx, k=1/np.sqrt(G.number_of_nodes()))
-                    except:
-                        pos = nx.spring_layout(G, seed=42+col_idx)
+#                 if G.number_of_nodes() > 0:
+#                     try:
+#                         pos = nx.spring_layout(G, seed=42+col_idx, k=1/np.sqrt(G.number_of_nodes()))
+#                     except:
+#                         pos = nx.spring_layout(G, seed=42+col_idx)
                     
-                    nx.draw_networkx_nodes(G, pos, ax=ax, node_color='#3498db', 
-                                          node_size=300, alpha=0.8, edgecolors='black', linewidths=1.5)
-                    nx.draw_networkx_edges(G, pos, ax=ax, edge_color='gray', 
-                                          width=2, alpha=0.7)
+#                     nx.draw_networkx_nodes(G, pos, ax=ax, node_color='#3498db', 
+#                                           node_size=300, alpha=0.8, edgecolors='black', linewidths=1.5)
+#                     nx.draw_networkx_edges(G, pos, ax=ax, edge_color='gray', 
+#                                           width=2, alpha=0.7)
                     
-                    info_text = f"{G.number_of_nodes()}n, {G.number_of_edges()}e"
-                    ax.text(0.5, -0.1, info_text, transform=ax.transAxes,
-                           ha='center', fontsize=14, fontweight='bold')
+#                     info_text = f"{G.number_of_nodes()}n, {G.number_of_edges()}e"
+#                     ax.text(0.5, -0.1, info_text, transform=ax.transAxes,
+#                            ha='center', fontsize=14, fontweight='bold')
             
-            ax.set_axis_off()
-            if col_idx == 0:
-                ax.text(-0.2, 0.5, 'Generated\n(Gen1)', transform=ax.transAxes,
-                       ha='right', va='center', fontsize=16, fontweight='bold', color='#3498db')
+#             ax.set_axis_off()
+#             if col_idx == 0:
+#                 ax.text(-0.2, 0.5, 'Generated\n(Gen1)', transform=ax.transAxes,
+#                        ha='right', va='center', fontsize=16, fontweight='bold', color='#3498db')
         
-        fig.suptitle(f'Ground Truth vs Generated Graphs (n={n_nodes} nodes, N={FIXED_N} training examples)', 
-                     fontsize=20, fontweight='bold', y=0.98)
-        plt.tight_layout(rect=[0.05, 0, 1, 0.96])
-        plt.savefig(fig_dir / f'gt_vs_generated_n{n_nodes}.png', dpi=300, bbox_inches='tight')
-        print(f"Saved: {fig_dir / f'gt_vs_generated_n{n_nodes}.png'}")
-        plt.close()
+#         fig.suptitle(f'Ground Truth vs Generated Graphs (n={n_nodes} nodes, N={FIXED_N} training examples)', 
+#                      fontsize=20, fontweight='bold', y=0.98)
+#         plt.tight_layout(rect=[0.05, 0, 1, 0.96])
+#         plt.savefig(fig_dir / f'gt_vs_generated_n{n_nodes}.png', dpi=300, bbox_inches='tight')
+#         print(f"Saved: {fig_dir / f'gt_vs_generated_n{n_nodes}.png'}")
+#         plt.close()
 
 
 def create_aggregate_visualizations(all_results, output_dir):
@@ -1439,105 +1221,105 @@ def create_aggregate_visualizations(all_results, output_dir):
     print(f"Saved: {fig_dir / 'memorization_to_generalization_histograms.png'}")
     plt.close()
 
-    # 1b. Feature-WL histogram plot: Memorization to Generalization using degree-feature WL
-    # Build lists if present
-    n_vals_f = []
-    for n_nodes in NODE_SIZES:
-        if n_nodes in all_results and 'generalization_scores_feat' in all_results[n_nodes] and 'memorization_scores_feat' in all_results[n_nodes]:
-            n_vals_f.append(n_nodes)
-    if len(n_vals_f) > 0:
-        n_plots = len(n_vals_f)
-        fig, axes = plt.subplots(1, n_plots, figsize=(5*n_plots, 5))
-        if n_plots == 1:
-            axes = [axes]
-        for idx, n_nodes in enumerate(n_vals_f):
-            result = all_results[n_nodes]
-            ax = axes[idx]
-            gen_scores = result.get('generalization_scores_feat', [])
-            mem_scores = result.get('memorization_scores_feat', [])
-            bins = np.linspace(0, 1, 21)
-            if len(mem_scores) > 0:
-                ax.hist(mem_scores, bins=bins, alpha=0.5, color='orange', label='Memorization (feat)', density=True, edgecolor='black')
-            if len(gen_scores) > 0:
-                ax.hist(gen_scores, bins=bins, alpha=0.5, color='blue', label='Generalization (feat)', density=True, edgecolor='black')
-            # Means
-            if len(gen_scores) > 0:
-                gen_mean_f = float(np.mean(gen_scores))
-                ax.axvline(gen_mean_f, color='darkblue', linestyle='--', linewidth=2.5, alpha=0.9)
-                ax.text(gen_mean_f, ax.get_ylim()[1]*0.9, f'{gen_mean_f:.2f}', ha='center', fontsize=12, color='darkblue', fontweight='bold', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-            if len(mem_scores) > 0:
-                mem_mean_f = float(np.mean(mem_scores))
-                ax.axvline(mem_mean_f, color='darkorange', linestyle='--', linewidth=2.5, alpha=0.9)
-                ax.text(mem_mean_f, ax.get_ylim()[1]*0.8, f'{mem_mean_f:.2f}', ha='center', fontsize=12, color='darkorange', fontweight='bold', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-            ax.set_xlabel('WL (degree-feature) Similarity', fontsize=25)
-            ax.set_ylabel('Density', fontsize=25)
-            ax.set_xlim(0, 1)
-            ax.tick_params(axis='both', labelsize=14)
-            if idx == 0:
-                ax.legend(fontsize=12, loc='upper left')
-        plt.tight_layout()
-        plt.savefig(fig_dir / 'memorization_to_generalization_histograms_feature.png', dpi=300, bbox_inches='tight')
-        print(f"Saved: {fig_dir / 'memorization_to_generalization_histograms_feature.png'}")
-        plt.close()
+    # # 1b. Feature-WL histogram plot: Memorization to Generalization using degree-feature WL
+    # # Build lists if present
+    # n_vals_f = []
+    # for n_nodes in NODE_SIZES:
+    #     if n_nodes in all_results and 'generalization_scores_feat' in all_results[n_nodes] and 'memorization_scores_feat' in all_results[n_nodes]:
+    #         n_vals_f.append(n_nodes)
+    # if len(n_vals_f) > 0:
+    #     n_plots = len(n_vals_f)
+    #     fig, axes = plt.subplots(1, n_plots, figsize=(5*n_plots, 5))
+    #     if n_plots == 1:
+    #         axes = [axes]
+    #     for idx, n_nodes in enumerate(n_vals_f):
+    #         result = all_results[n_nodes]
+    #         ax = axes[idx]
+    #         gen_scores = result.get('generalization_scores_feat', [])
+    #         mem_scores = result.get('memorization_scores_feat', [])
+    #         bins = np.linspace(0, 1, 21)
+    #         if len(mem_scores) > 0:
+    #             ax.hist(mem_scores, bins=bins, alpha=0.5, color='orange', label='Memorization (feat)', density=True, edgecolor='black')
+    #         if len(gen_scores) > 0:
+    #             ax.hist(gen_scores, bins=bins, alpha=0.5, color='blue', label='Generalization (feat)', density=True, edgecolor='black')
+    #         # Means
+    #         if len(gen_scores) > 0:
+    #             gen_mean_f = float(np.mean(gen_scores))
+    #             ax.axvline(gen_mean_f, color='darkblue', linestyle='--', linewidth=2.5, alpha=0.9)
+    #             ax.text(gen_mean_f, ax.get_ylim()[1]*0.9, f'{gen_mean_f:.2f}', ha='center', fontsize=12, color='darkblue', fontweight='bold', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    #         if len(mem_scores) > 0:
+    #             mem_mean_f = float(np.mean(mem_scores))
+    #             ax.axvline(mem_mean_f, color='darkorange', linestyle='--', linewidth=2.5, alpha=0.9)
+    #             ax.text(mem_mean_f, ax.get_ylim()[1]*0.8, f'{mem_mean_f:.2f}', ha='center', fontsize=12, color='darkorange', fontweight='bold', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    #         ax.set_xlabel('WL (degree-feature) Similarity', fontsize=25)
+    #         ax.set_ylabel('Density', fontsize=25)
+    #         ax.set_xlim(0, 1)
+    #         ax.tick_params(axis='both', labelsize=14)
+    #         if idx == 0:
+    #             ax.legend(fontsize=12, loc='upper left')
+    #     plt.tight_layout()
+    #     plt.savefig(fig_dir / 'memorization_to_generalization_histograms_feature.png', dpi=300, bbox_inches='tight')
+    #     print(f"Saved: {fig_dir / 'memorization_to_generalization_histograms_feature.png'}")
+    #     plt.close()
     
-    # 2. Convergence line plot
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.errorbar(n_vals, gen_means, yerr=gen_stds, marker='o', color='blue',
-                linewidth=2, markersize=8, capsize=5, label='Generalization (Gen1 vs Gen2)')
-    ax.errorbar(n_vals, mem_means, yerr=mem_stds, marker='s', color='orange',
-                linewidth=2, markersize=8, capsize=5, label='Memorization (vs training)')
-    ax.set_xlabel('Graph Complexity (number of nodes)', fontsize=25)
-    ax.set_ylabel('WL Kernel Similarity', fontsize=25)
-    ax.tick_params(axis='both', labelsize=18)
-    ax.legend(fontsize=18)
-    ax.set_xscale('log')
-    ax.set_ylim(0, 1.05)
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(fig_dir / 'wl_similarity_vs_complexity.png', dpi=300, bbox_inches='tight')
-    print(f"Saved: {fig_dir / 'wl_similarity_vs_complexity.png'}")
-    plt.close()
+    # # 2. Convergence line plot
+    # fig, ax = plt.subplots(figsize=(10, 6))
+    # ax.errorbar(n_vals, gen_means, yerr=gen_stds, marker='o', color='blue',
+    #             linewidth=2, markersize=8, capsize=5, label='Generalization (Gen1 vs Gen2)')
+    # ax.errorbar(n_vals, mem_means, yerr=mem_stds, marker='s', color='orange',
+    #             linewidth=2, markersize=8, capsize=5, label='Memorization (vs training)')
+    # ax.set_xlabel('Graph Complexity (number of nodes)', fontsize=25)
+    # ax.set_ylabel('WL Kernel Similarity', fontsize=25)
+    # ax.tick_params(axis='both', labelsize=18)
+    # ax.legend(fontsize=18)
+    # ax.set_xscale('log')
+    # ax.set_ylim(0, 1.05)
+    # ax.grid(True, alpha=0.3)
+    # plt.tight_layout()
+    # plt.savefig(fig_dir / 'wl_similarity_vs_complexity.png', dpi=300, bbox_inches='tight')
+    # print(f"Saved: {fig_dir / 'wl_similarity_vs_complexity.png'}")
+    # plt.close()
     
-    # 3. Memorization vs Generalization Difference Plot (KEY METRIC)
-    fig, ax = plt.subplots(figsize=(10, 6))
+    # # 3. Memorization vs Generalization Difference Plot (KEY METRIC)
+    # fig, ax = plt.subplots(figsize=(10, 6))
     
-    # Calculate the difference: Mem - Gen
-    # Positive = Memorization regime, Negative = Generalization regime
-    mem_gen_diff = np.array(mem_means) - np.array(gen_means)
+    # # Calculate the difference: Mem - Gen
+    # # Positive = Memorization regime, Negative = Generalization regime
+    # mem_gen_diff = np.array(mem_means) - np.array(gen_means)
     
-    colors = ['red' if diff > 0 else 'green' for diff in mem_gen_diff]
-    ax.bar(range(len(n_vals)), mem_gen_diff, color=colors, alpha=0.7, edgecolor='black', linewidth=2)
-    ax.axhline(0, color='black', linestyle='-', linewidth=1.5, alpha=0.5)
+    # colors = ['red' if diff > 0 else 'green' for diff in mem_gen_diff]
+    # ax.bar(range(len(n_vals)), mem_gen_diff, color=colors, alpha=0.7, edgecolor='black', linewidth=2)
+    # ax.axhline(0, color='black', linestyle='-', linewidth=1.5, alpha=0.5)
     
-    # Add shaded regions
-    ax.axhspan(0, ax.get_ylim()[1], alpha=0.1, color='red', label='Memorization Regime')
-    ax.axhspan(ax.get_ylim()[0], 0, alpha=0.1, color='green', label='Generalization Regime')
+    # # Add shaded regions
+    # ax.axhspan(0, ax.get_ylim()[1], alpha=0.1, color='red', label='Memorization Regime')
+    # ax.axhspan(ax.get_ylim()[0], 0, alpha=0.1, color='green', label='Generalization Regime')
     
-    ax.set_xlabel('Graph Complexity (number of nodes)', fontsize=25)
-    ax.set_ylabel('Mem_WL - Gen_WL', fontsize=25)
-    ax.set_xticks(range(len(n_vals)))
-    ax.set_xticklabels([f'n={n}' for n in n_vals], fontsize=18)
-    ax.tick_params(axis='y', labelsize=18)
-    ax.legend(fontsize=16, loc='upper right')
-    ax.grid(True, alpha=0.3, axis='y')
-    plt.tight_layout()
-    plt.savefig(fig_dir / 'memorization_vs_generalization_difference.png', dpi=300, bbox_inches='tight')
-    print(f"Saved: {fig_dir / 'memorization_vs_generalization_difference.png'}")
-    plt.close()
+    # ax.set_xlabel('Graph Complexity (number of nodes)', fontsize=25)
+    # ax.set_ylabel('Mem_WL - Gen_WL', fontsize=25)
+    # ax.set_xticks(range(len(n_vals)))
+    # ax.set_xticklabels([f'n={n}' for n in n_vals], fontsize=18)
+    # ax.tick_params(axis='y', labelsize=18)
+    # ax.legend(fontsize=16, loc='upper right')
+    # ax.grid(True, alpha=0.3, axis='y')
+    # plt.tight_layout()
+    # plt.savefig(fig_dir / 'memorization_vs_generalization_difference.png', dpi=300, bbox_inches='tight')
+    # print(f"Saved: {fig_dir / 'memorization_vs_generalization_difference.png'}")
+    # plt.close()
     
-    # 4. Complexity ratio plot
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(n_vals, complexity_ratios, 'o-', color='#2ecc71', linewidth=2, markersize=8)
-    ax.set_xlabel('Graph Complexity (number of nodes)', fontsize=25)
-    ax.set_ylabel('Complexity/Dataset Ratio', fontsize=25)
-    ax.tick_params(axis='both', labelsize=18)
-    ax.set_xscale('log')
-    ax.set_yscale('log')
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(fig_dir / 'complexity_ratio_vs_n.png', dpi=300, bbox_inches='tight')
-    print(f"Saved: {fig_dir / 'complexity_ratio_vs_n.png'}")
-    plt.close()
+    # # 4. Complexity ratio plot
+    # fig, ax = plt.subplots(figsize=(10, 6))
+    # ax.plot(n_vals, complexity_ratios, 'o-', color='#2ecc71', linewidth=2, markersize=8)
+    # ax.set_xlabel('Graph Complexity (number of nodes)', fontsize=25)
+    # ax.set_ylabel('Complexity/Dataset Ratio', fontsize=25)
+    # ax.tick_params(axis='both', labelsize=18)
+    # ax.set_xscale('log')
+    # ax.set_yscale('log')
+    # ax.grid(True, alpha=0.3)
+    # plt.tight_layout()
+    # plt.savefig(fig_dir / 'complexity_ratio_vs_n.png', dpi=300, bbox_inches='tight')
+    # print(f"Saved: {fig_dir / 'complexity_ratio_vs_n.png'}")
+    # plt.close()
 
 
 def save_summary(all_results, output_dir):
@@ -1654,6 +1436,65 @@ def main():
     output_dir = Path(args.output_dir) / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Save training configuration
+    config_path = output_dir / "training_config.txt"
+    with open(config_path, 'w') as cf:
+        cf.write("="*80 + "\n")
+        cf.write("Training Configuration\n")
+        cf.write("="*80 + "\n")
+        cf.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        cf.write(f"Run ID: {run_id}\n\n")
+        
+        cf.write("Dataset Configuration:\n")
+        cf.write("-" * 80 + "\n")
+        cf.write(f"Fixed training size (N): {FIXED_N}\n")
+        cf.write(f"Node sizes to test: {NODE_SIZES}\n")
+        cf.write(f"Test set size: {TEST_SET_SIZE}\n")
+        cf.write(f"Split seed: {SPLIT_SEED}\n")
+        cf.write(f"Use pre-splits: {args.use_pre_splits}\n\n")
+        
+        cf.write("Model Architecture:\n")
+        cf.write("-" * 80 + "\n")
+        cf.write(f"Latent dimension: {LATENT_DIM}\n")
+        cf.write(f"Hidden dim encoder: {HIDDEN_DIM_ENCODER}\n")
+        cf.write(f"Hidden dim decoder: {HIDDEN_DIM_DECODER}\n")
+        cf.write(f"Hidden dim denoiser: {HIDDEN_DIM_DENOISE}\n")
+        cf.write(f"Max nodes (N_MAX_NODES): {N_MAX_NODES}\n")
+        cf.write(f"Number of properties: {N_PROPERTIES}\n")
+        cf.write(f"Use bias: {USE_BIAS}\n\n")
+        
+        cf.write("Training Hyperparameters:\n")
+        cf.write("-" * 80 + "\n")
+        cf.write(f"Autoencoder epochs: {EPOCHS_AUTOENCODER}\n")
+        cf.write(f"Denoiser epochs: {EPOCHS_DENOISER}\n")
+        cf.write(f"Early stopping patience: {EARLY_STOPPING_PATIENCE}\n")
+        cf.write(f"Batch size: {BATCH_SIZE}\n")
+        cf.write(f"Learning rate: {LEARNING_RATE}\n")
+        cf.write(f"Gradient clipping: {GRAD_CLIP}\n")
+        cf.write(f"Diffusion timesteps: {TIMESTEPS}\n")
+        cf.write(f"Beta KL weight: {BETA_KL_WEIGHT}\n")
+        cf.write(f"Small dataset threshold: {SMALL_DATASET_THRESHOLD}\n")
+        cf.write(f"Small dataset KL weight: {SMALL_DATASET_KL_WEIGHT}\n")
+        cf.write(f"Small dataset dropout: {SMALL_DATASET_DROPOUT}\n\n")
+        
+        cf.write("Evaluation Configuration:\n")
+        cf.write("-" * 80 + "\n")
+        cf.write(f"Samples per condition: {NUM_SAMPLES_PER_CONDITION}\n")
+        cf.write(f"K-nearest shortlist size: {K_NEAREST}\n\n")
+        
+        cf.write("Device Configuration:\n")
+        cf.write("-" * 80 + "\n")
+        cf.write(f"Device: {device}\n")
+        cf.write(f"Using TPU: {USE_TPU}\n\n")
+        
+        cf.write("Command-line Arguments:\n")
+        cf.write("-" * 80 + "\n")
+        for arg, value in vars(args).items():
+            cf.write(f"{arg}: {value}\n")
+        cf.write("="*80 + "\n")
+    
+    print(f"✅ Training configuration saved to: {config_path}")
+    
     # Initialize incremental metrics progress log
     progress_path = output_dir / "metrics_progress.txt"
     with open(progress_path, 'w') as pf:
@@ -1662,10 +1503,6 @@ def main():
     feat_wl_progress_path = output_dir / "wl_feature_metrics_progress.txt"
     with open(feat_wl_progress_path, 'w') as ff:
         ff.write("n_nodes\tGen_WLf_Mean\tGen_WLf_Std\n")
-    # Separate progress for embedding set metrics (FID/MMD)
-    embed_progress_path = output_dir / "embed_metrics_progress.txt"
-    with open(embed_progress_path, 'w') as ef:
-        ef.write("n_nodes\tFID_G1G2\tFID_G1S1\tFID_G2S2\tFID_G1S2\tFID_G2S1\tMMD_G1G2\tMMD_G1S1\tMMD_G2S2\tMMD_G1S2\tMMD_G2S1\n")
     
     print(f"\n{'='*80}")
     print("Graph Complexity Study: Memorization to Generalization")
@@ -1734,23 +1571,14 @@ def main():
         if gfeat is not None and len(gfeat) > 0:
             with open(feat_wl_progress_path, 'a') as ff:
                 ff.write(f"{n_nodes}\t{float(np.mean(gfeat)):.4f}\t{float(np.std(gfeat)):.4f}\n")
-        # Append embedding set metrics for this n
-        esm = result.get('embed_set_metrics')
-        if esm is not None:
-            with open(embed_progress_path, 'a') as ef:
-                ef.write(
-                    f"{n_nodes}\t"
-                    f"{esm['fid']['G1_G2']:.6f}\t{esm['fid']['G1_S1']:.6f}\t{esm['fid']['G2_S2']:.6f}\t{esm['fid']['G1_S2']:.6f}\t{esm['fid']['G2_S1']:.6f}\t"
-                    f"{esm['mmd']['G1_G2']:.6f}\t{esm['mmd']['G1_S1']:.6f}\t{esm['mmd']['G2_S2']:.6f}\t{esm['mmd']['G1_S2']:.6f}\t{esm['mmd']['G2_S1']:.6f}\n"
-                )
         
         # Create immediate visualization for this n (don't wait till end)
         print(f"\n--- Creating immediate visualizations for n={n_nodes} ---")
-        visualize_gt_vs_generated_single(result, n_nodes, output_dir)
+        # visualize_gt_vs_generated_single(result, n_nodes, output_dir)
         visualize_example_graphs_single(result, n_nodes, output_dir)
     
     # Create visualizations
-    visualize_gt_vs_generated(all_results, output_dir)  # GT vs Generated comparison
+    # visualize_gt_vs_generated(all_results, output_dir)  # GT vs Generated comparison
     visualize_example_graphs(all_results, output_dir)   # 4-source comparison
     create_aggregate_visualizations(all_results, output_dir)  # Aggregate plots
     

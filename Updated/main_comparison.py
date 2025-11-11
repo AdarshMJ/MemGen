@@ -67,7 +67,36 @@ N_MAX_NODES = 500  # Maximum nodes (capped at 500 for computational feasibility)
 N_PROPERTIES = 15  # Conditioning properties include homophily measurements
 TIMESTEPS = 500  # Same diffusion timesteps for all experiments
 
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+# Device detection: TPU > CUDA > CPU
+USE_TPU = False
+xm = None  # Initialize xm globally for optimizer_step
+
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    try:
+        device = torch_xla.device()  # Call the function to get device
+        print(f"✅ Using TPU device: {device}")
+        USE_TPU = True
+    except RuntimeError as e:
+        print(f"⚠️  TPU initialization failed: {str(e)[:100]}...")
+        print(f"⚠️  Falling back to CUDA/CPU")
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        USE_TPU = False
+        xm = None
+        print(f"Using device: {device}")
+except ImportError:
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    xm = None
+    print(f"Using device: {device}")
+
+
+def optimizer_step(optimizer):
+    """Wrap optimizer.step() for TPU compatibility."""
+    if USE_TPU and xm is not None:
+        xm.optimizer_step(optimizer)
+    else:
+        optimizer.step()
 
 
 def load_dataset(data_path='data/labelhomophily0.5_10nodes_graphs.pkl'):
@@ -615,7 +644,7 @@ def train_autoencoder(data_list, run_name, output_dir):
             train_recon_sum += recon.item()
             train_kld_sum += kld.item()
             train_count += int(torch.max(data.batch).item()) + 1
-            optimizer.step()
+            optimizer_step(optimizer)
         
         # Validation
         autoencoder.eval()
@@ -806,7 +835,7 @@ def train_denoiser(autoencoder, data_list, run_name, output_dir):
             torch.nn.utils.clip_grad_norm_(denoise_model.parameters(), GRAD_CLIP)
             train_loss_all += x_g.size(0) * loss.item()
             train_count += x_g.size(0)
-            optimizer.step()
+            optimizer_step(optimizer)
         
         # Validation
         denoise_model.eval()

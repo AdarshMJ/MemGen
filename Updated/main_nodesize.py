@@ -567,7 +567,7 @@ def _load_precomputed_splits(n_nodes, data_path, test_size, seed, stats_cache_pa
 
 def train_autoencoder(data_list, run_name, output_dir):
     """Train VGAE (imported logic from main_comparison.py)."""
-    
+    import main_comparison
     # Inject hyperparameters from main_nodesize into main_comparison module
     main_comparison.BETA_KL_WEIGHT = BETA_KL_WEIGHT
     main_comparison.SMALL_DATASET_KL_WEIGHT = SMALL_DATASET_KL_WEIGHT

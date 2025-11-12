@@ -624,7 +624,7 @@ def train_autoencoder(data_list, run_name, output_dir):
         n_layers_enc=2,
         n_layers_dec=3,
         n_max_nodes=N_MAX_NODES,
-        use_bias=USE_BIAS if 'USE_BIAS' in globals() else True
+        use_bias=USE_BIAS if 'USE_BIAS' in globals() else False
     ).to(device)
     
     dataset_size = len(data_list)
@@ -857,7 +857,7 @@ def train_denoiser(autoencoder, data_list, run_name, output_dir):
         n_layers=3,
         n_cond=N_PROPERTIES,
         d_cond=128,
-        use_bias=USE_BIAS if 'USE_BIAS' in globals() else True
+        use_bias=USE_BIAS if 'USE_BIAS' in globals() else False
     ).to(device)
     
     optimizer = torch.optim.Adam(denoise_model.parameters(), lr=LEARNING_RATE)

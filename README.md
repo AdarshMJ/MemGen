@@ -21,3 +21,9 @@ python seeded_graph_generator.py \
 ```python
 python main_nodesize.py --no-bias
 ```
+
+#### Evaluating saved model
+
+```python
+python evaluate_saved_models.py --checkpoint-dir outputs/nodesize_study/WL_iter=5 --node-sizes 20 --output-dir outputs/nodesize_study/WL_iter=5/evaluation_test --N 500 --k-nearest 1
+```

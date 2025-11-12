@@ -1,0 +1,46 @@
+name: pygeo310
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  # Python
+  - python=3.10
+  
+  # Core scientific computing
+  - numpy>=1.23.0
+  - scipy>=1.9.0
+  - pandas>=1.5.0
+  
+  # PyTorch (CPU version - replace with cuda version if needed)
+  - pytorch=2.0.1
+  - torchvision
+  - torchaudio
+  - cpuonly  # Remove this line and add pytorch-cuda=11.8 for GPU
+  
+  # Visualization
+  - matplotlib>=3.6.0
+  - seaborn>=0.12.0
+  
+  # Graph processing
+  - networkx>=2.8.0
+  
+  # ML utilities
+  - scikit-learn>=1.2.0
+  - tqdm>=4.64.0
+  
+  # Data handling
+  - pickle5
+  
+  # Utilities
+  - tabulate
+  
+  # Pip packages (PyTorch Geometric and dependencies)
+  - pip
+  - pip:
+    # PyTorch Geometric - install from PyPI for compatibility
+    - torch-geometric>=2.3.0
+    - torch-scatter
+    - torch-sparse
+    - torch-cluster
+    - torch-spline-conv

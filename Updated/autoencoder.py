@@ -520,7 +520,7 @@ class VariationalAutoEncoder(nn.Module):
         # By default, return probabilities (safer for downstream calibration)
         return self.decoder(mu, use_soft_sampling=True)
 
-    def loss_function(self, data, beta=0.05):
+    def loss_function(self, data, beta=0.05, lambda_diversity=0.0):
         # Encode
         x_g  = self.encoder(data)
         mu = self.fc_mu(x_g)
@@ -554,7 +554,26 @@ class VariationalAutoEncoder(nn.Module):
 
         # KL term
         kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        loss = recon + beta * kld
+        
+        # Spectral diversity loss (prevents posterior collapse)
+        diversity_loss = 0.0
+        if lambda_diversity > 0 and z.size(0) > 1:  # Need at least 2 samples
+            # Center the batch
+            z_centered = z - z.mean(dim=0, keepdim=True)
+            # Compute covariance
+            cov = (z_centered.T @ z_centered) / (z.size(0) - 1 + 1e-6)
+            # Get eigenvalues
+            eigenvalues = torch.linalg.eigvalsh(cov)
+            eigenvalues = torch.clamp(eigenvalues, min=1e-6)
+            # Spectral entropy (high = uniform, low = collapsed)
+            probs = eigenvalues / (eigenvalues.sum() + 1e-10)
+            spectral_entropy = -(probs * torch.log(probs + 1e-10)).sum()
+            # Target entropy for uniform distribution
+            target_entropy = torch.log(torch.tensor(z.size(1), dtype=torch.float32, device=z.device))
+            # Penalty for low entropy (collapse)
+            diversity_loss = F.relu(target_entropy - spectral_entropy)
+        
+        loss = recon + beta * kld + lambda_diversity * diversity_loss
         return loss, recon, kld
 
 

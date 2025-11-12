@@ -30,6 +30,119 @@ from autoencoder import VariationalAutoEncoder
 from denoise_model import DenoiseNN
 
 
+def infer_model_config_from_checkpoint(checkpoint_path):
+    """Infer model configuration from checkpoint weights."""
+    ckpt = torch.load(checkpoint_path, map_location='cpu')
+    state_dict = ckpt['state_dict']
+    
+    # Infer input_dim from first encoder layer
+    first_conv_weight_key = 'encoder.convs.0.nn.0.weight'
+    if first_conv_weight_key in state_dict:
+        weight_shape = state_dict[first_conv_weight_key].shape
+        hidden_dim_enc = weight_shape[0]
+        input_dim = weight_shape[1]
+    else:
+        # Fallback defaults
+        hidden_dim_enc = 128
+        input_dim = 2
+    
+    # Infer number of encoder layers
+    n_layers_enc = 0
+    while f'encoder.convs.{n_layers_enc}.nn.0.weight' in state_dict:
+        n_layers_enc += 1
+    if n_layers_enc == 0:
+        n_layers_enc = 3  # Fallback
+    
+    # Infer latent_dim from fc_mu
+    if 'fc_mu.weight' in state_dict:
+        latent_dim = state_dict['fc_mu.weight'].shape[0]
+    else:
+        latent_dim = 32  # Fallback
+    
+    # Infer decoder hidden dim from first decoder layer
+    if 'decoder.mlp.0.weight' in state_dict:
+        hidden_dim_dec = state_dict['decoder.mlp.0.weight'].shape[0]
+    else:
+        hidden_dim_dec = 256  # Fallback
+    
+    # Infer n_layers_dec
+    n_layers_dec = 0
+    while f'decoder.mlp.{n_layers_dec}.weight' in state_dict:
+        n_layers_dec += 1
+    if n_layers_dec == 0:
+        n_layers_dec = 3  # Fallback
+    
+    # Infer n_max_nodes from last decoder layer
+    last_decoder_key = f'decoder.mlp.{n_layers_dec - 1}.weight'
+    if last_decoder_key in state_dict:
+        n_edges_ut = state_dict[last_decoder_key].shape[0]
+        # Solve: n * (n - 1) / 2 = n_edges_ut
+        import math
+        n_max_nodes = int((1 + math.sqrt(1 + 8 * n_edges_ut)) / 2)
+    else:
+        n_max_nodes = 500  # Fallback
+    
+    # Detect USE_BIAS
+    use_bias = any('bias' in k for k in state_dict.keys())
+    
+    return {
+        'input_dim': input_dim,
+        'hidden_dim_enc': hidden_dim_enc,
+        'hidden_dim_dec': hidden_dim_dec,
+        'latent_dim': latent_dim,
+        'n_layers_enc': n_layers_enc,
+        'n_layers_dec': n_layers_dec,
+        'n_max_nodes': n_max_nodes,
+        'use_bias': use_bias
+    }
+
+
+def infer_denoiser_config_from_checkpoint(checkpoint_path, latent_dim):
+    """Infer denoiser configuration from checkpoint weights."""
+    ckpt = torch.load(checkpoint_path, map_location='cpu')
+    state_dict = ckpt['state_dict']
+    
+    # Infer d_cond from cond_mlp first layer
+    if 'cond_mlp.0.weight' in state_dict:
+        d_cond = state_dict['cond_mlp.0.weight'].shape[0]
+    else:
+        d_cond = 64  # Fallback
+    
+    # Infer n_cond from cond_mlp input
+    if 'cond_mlp.0.weight' in state_dict:
+        n_cond = state_dict['cond_mlp.0.weight'].shape[1]
+    else:
+        n_cond = N_PROPERTIES  # Fallback
+    
+    # Infer hidden_dim from first MLP layer
+    if 'mlp.0.weight' in state_dict:
+        hidden_dim = state_dict['mlp.0.weight'].shape[0]
+    else:
+        hidden_dim = 512  # Fallback
+    
+    # Infer n_layers
+    n_layers = 0
+    while f'mlp.{n_layers}.weight' in state_dict:
+        n_layers += 1
+    if n_layers == 0:
+        n_layers = 4  # Fallback
+    
+    # Try to infer timesteps from checkpoint metadata
+    timesteps = ckpt.get('timesteps', None)
+    if timesteps is None and 'config' in ckpt:
+        timesteps = ckpt['config'].get('timesteps', 500)
+    elif timesteps is None:
+        timesteps = 500  # Default fallback
+    
+    return {
+        'hidden_dim': hidden_dim,
+        'n_layers': n_layers,
+        'n_cond': n_cond,
+        'd_cond': d_cond,
+        'timesteps': timesteps
+    }
+
+
 def visualize_gt_vs_generated(s1_graphs, s2_graphs, gen1_graphs, gen2_graphs, n_nodes, output_dir):
     """Visualize ground truth vs generated graphs."""
     import matplotlib.pyplot as plt
@@ -222,7 +335,7 @@ def create_aggregate_plots(all_results, output_dir):
         print(f"  Saved: aggregate_empty_graphs.png")
 
 
-def load_models(checkpoint_dir: Path, n_nodes: int, N: int = 2500):
+def load_models(checkpoint_dir: Path, n_nodes: int, N: int = 500):
     """Load saved autoencoder and denoiser models.
     
     Args:
@@ -239,10 +352,10 @@ def load_models(checkpoint_dir: Path, n_nodes: int, N: int = 2500):
         raise FileNotFoundError(f"Checkpoint directory not found: {exp_dir}")
     
     # Check for checkpoint files
-    ae1_path = exp_dir / "autoencoder_Gen1_N2500.pth.tar"
-    dn1_path = exp_dir / "denoise_Gen1_N2500.pth.tar"
-    ae2_path = exp_dir / "autoencoder_Gen2_N2500.pth.tar"
-    dn2_path = exp_dir / "denoise_Gen2_N2500.pth.tar"
+    ae1_path = exp_dir / "autoencoder_Gen1_N500.pth.tar"
+    dn1_path = exp_dir / "denoise_Gen1_N500.pth.tar"
+    ae2_path = exp_dir / "autoencoder_Gen2_N500.pth.tar"
+    dn2_path = exp_dir / "denoise_Gen2_N500.pth.tar"
     
     for path in [ae1_path, dn1_path, ae2_path, dn2_path]:
         if not path.exists():
@@ -256,134 +369,103 @@ def load_models(checkpoint_dir: Path, n_nodes: int, N: int = 2500):
     print(f"  Autoencoder Gen2: {ae2_path.name}")
     print(f"  Denoiser Gen2:    {dn2_path.name}")
     
-    # Load dataset to get feature dimension
-    data_list, data_path = load_dataset(n_nodes)
+    # Infer Gen1 autoencoder configuration
+    print(f"\n  Detecting Gen1 autoencoder configuration...")
+    ae1_config = infer_model_config_from_checkpoint(ae1_path)
+    print(f"  Inferred config: input_dim={ae1_config['input_dim']}, "
+          f"hidden_enc={ae1_config['hidden_dim_enc']}, hidden_dec={ae1_config['hidden_dim_dec']}, "
+          f"latent={ae1_config['latent_dim']}, layers_enc={ae1_config['n_layers_enc']}, "
+          f"layers_dec={ae1_config['n_layers_dec']}, n_max_nodes={ae1_config['n_max_nodes']}, "
+          f"use_bias={ae1_config['use_bias']}")
     
-    # Determine input feature dimension
-    if data_list is not None and len(data_list) > 0:
-        # Legacy format: list of PyG Data objects
-        input_feat_dim = data_list[0].x.shape[1] if hasattr(data_list[0], 'x') and data_list[0].x is not None else 2
-    else:
-        # Seeded format: load one sample to check
-        from pathlib import Path
-        seeded_dir = Path(data_path)
-        if seeded_dir.exists() and (seeded_dir / 'S1.pt').exists():
-            s1_sample = torch.load(seeded_dir / 'S1.pt', map_location='cpu', weights_only=False)
-            if len(s1_sample) > 0:
-                data_pyg, _ = s1_sample[0]
-                input_feat_dim = data_pyg.x.shape[1] if hasattr(data_pyg, 'x') and data_pyg.x is not None else 2
-            else:
-                input_feat_dim = 2  # Default fallback
-        else:
-            input_feat_dim = 2  # Default fallback
+    # Infer Gen2 autoencoder configuration
+    print(f"\n  Detecting Gen2 autoencoder configuration...")
+    ae2_config = infer_model_config_from_checkpoint(ae2_path)
+    print(f"  Inferred config: input_dim={ae2_config['input_dim']}, "
+          f"hidden_enc={ae2_config['hidden_dim_enc']}, hidden_dec={ae2_config['hidden_dim_dec']}, "
+          f"latent={ae2_config['latent_dim']}, layers_enc={ae2_config['n_layers_enc']}, "
+          f"layers_dec={ae2_config['n_layers_dec']}, n_max_nodes={ae2_config['n_max_nodes']}, "
+          f"use_bias={ae2_config['use_bias']}")
     
-    print(f"  Input feature dim: {input_feat_dim}")
+    # Infer Gen1 denoiser configuration
+    print(f"\n  Detecting Gen1 denoiser configuration...")
+    dn1_config = infer_denoiser_config_from_checkpoint(dn1_path, ae1_config['latent_dim'])
+    print(f"  Inferred config: hidden={dn1_config['hidden_dim']}, "
+          f"n_layers={dn1_config['n_layers']}, n_cond={dn1_config['n_cond']}, "
+          f"d_cond={dn1_config['d_cond']}, timesteps={dn1_config['timesteps']}")
     
-    # Load one checkpoint to detect training configuration (bias, n_max_nodes)
-    print(f"\n  Detecting training configuration from checkpoint...")
-    ae1_ckpt_test = torch.load(ae1_path, map_location='cpu', weights_only=False)
+    # Infer Gen2 denoiser configuration
+    print(f"\n  Detecting Gen2 denoiser configuration...")
+    dn2_config = infer_denoiser_config_from_checkpoint(dn2_path, ae2_config['latent_dim'])
+    print(f"  Inferred config: hidden={dn2_config['hidden_dim']}, "
+          f"n_layers={dn2_config['n_layers']}, n_cond={dn2_config['n_cond']}, "
+          f"d_cond={dn2_config['d_cond']}, timesteps={dn2_config['timesteps']}")
     
-    # Detect USE_BIAS from checkpoint keys
-    has_bias_in_checkpoint = any('bias' in k for k in ae1_ckpt_test['state_dict'].keys())
+    # Use timesteps from Gen1 (should be same for both)
+    timesteps_actual = dn1_config['timesteps']
     
-    # Detect N_MAX_NODES from decoder output size
-    # decoder.mlp.2.weight (or last layer) has shape [n_edges_ut, hidden_dim]
-    # where n_edges_ut = n_max_nodes * (n_max_nodes - 1) // 2
-    decoder_last_layer_key = [k for k in ae1_ckpt_test['state_dict'].keys() if 'decoder.mlp' in k and 'weight' in k][-1]
-    n_edges_ut = ae1_ckpt_test['state_dict'][decoder_last_layer_key].shape[0]
-    
-    # Solve: n_edges_ut = n * (n - 1) / 2
-    # => n^2 - n - 2*n_edges_ut = 0
-    # => n = (1 + sqrt(1 + 8*n_edges_ut)) / 2
-    n_max_nodes_detected = int((1 + np.sqrt(1 + 8 * n_edges_ut)) / 2)
-    
-    # Detect hidden dimensions from autoencoder
-    # decoder.mlp.0.weight has shape [hidden_dim_decoder, latent_dim]
-    hidden_dim_decoder_detected = ae1_ckpt_test['state_dict']['decoder.mlp.0.weight'].shape[0]
-    
-    # Load denoiser checkpoint to detect its hidden dim
-    dn1_ckpt_test = torch.load(dn1_path, map_location='cpu', weights_only=False)
-    # time_mlp.1.weight has shape [hidden_dim_denoise, hidden_dim_denoise]
-    hidden_dim_denoise_detected = dn1_ckpt_test['state_dict']['time_mlp.1.weight'].shape[0]
-    
-    # Try to detect TIMESTEPS from checkpoint metadata or use default
-    timesteps_detected = dn1_ckpt_test.get('timesteps', None)
-    if timesteps_detected is None:
-        # Try to infer from checkpoint metadata
-        if 'config' in dn1_ckpt_test and 'timesteps' in dn1_ckpt_test['config']:
-            timesteps_detected = dn1_ckpt_test['config']['timesteps']
-        else:
-            # Default: most LatestWorking checkpoints used 500 timesteps
-            timesteps_detected = 500
-            print(f"  ⚠️  TIMESTEPS not found in checkpoint, using default: {timesteps_detected}")
-    
-    print(f"  Detected USE_BIAS: {has_bias_in_checkpoint}")
-    print(f"  Detected N_MAX_NODES: {n_max_nodes_detected} (n_edges_ut={n_edges_ut})")
-    print(f"  Detected HIDDEN_DIM_DECODER: {hidden_dim_decoder_detected}")
-    print(f"  Detected HIDDEN_DIM_DENOISE: {hidden_dim_denoise_detected}")
-    print(f"  Detected TIMESTEPS: {timesteps_detected}")
-    
-    # Use detected settings for this model
-    use_bias_actual = has_bias_in_checkpoint
-    n_max_nodes_actual = n_max_nodes_detected
-    hidden_dim_decoder_actual = hidden_dim_decoder_detected
-    hidden_dim_denoise_actual = hidden_dim_denoise_detected
-    timesteps_actual = timesteps_detected
-    
-    print(f"  Creating models with detected configuration...")
-    
-    # Create models with detected settings
+    # Create Gen1 autoencoder
+    print(f"\n  Creating models with detected configuration...")
     autoencoder_gen1 = VariationalAutoEncoder(
-        input_dim=input_feat_dim,
-        hidden_dim_enc=HIDDEN_DIM_ENCODER,
-        hidden_dim_dec=hidden_dim_decoder_actual,
-        latent_dim=LATENT_DIM,
-        n_layers_enc=2,
-        n_layers_dec=3,
-        n_max_nodes=n_max_nodes_actual,
-        use_bias=use_bias_actual
+        input_dim=ae1_config['input_dim'],
+        hidden_dim_enc=ae1_config['hidden_dim_enc'],
+        hidden_dim_dec=ae1_config['hidden_dim_dec'],
+        latent_dim=ae1_config['latent_dim'],
+        n_layers_enc=ae1_config['n_layers_enc'],
+        n_layers_dec=ae1_config['n_layers_dec'],
+        n_max_nodes=ae1_config['n_max_nodes'],
+        use_bias=ae1_config['use_bias']
     ).to(device)
     
+    # Create Gen2 autoencoder
     autoencoder_gen2 = VariationalAutoEncoder(
-        input_dim=input_feat_dim,
-        hidden_dim_enc=HIDDEN_DIM_ENCODER,
-        hidden_dim_dec=hidden_dim_decoder_actual,
-        latent_dim=LATENT_DIM,
-        n_layers_enc=2,
-        n_layers_dec=3,
-        n_max_nodes=n_max_nodes_actual,
-        use_bias=use_bias_actual
+        input_dim=ae2_config['input_dim'],
+        hidden_dim_enc=ae2_config['hidden_dim_enc'],
+        hidden_dim_dec=ae2_config['hidden_dim_dec'],
+        latent_dim=ae2_config['latent_dim'],
+        n_layers_enc=ae2_config['n_layers_enc'],
+        n_layers_dec=ae2_config['n_layers_dec'],
+        n_max_nodes=ae2_config['n_max_nodes'],
+        use_bias=ae2_config['use_bias']
     ).to(device)
     
+    # Create Gen1 denoiser
     denoise_gen1 = DenoiseNN(
-        input_dim=LATENT_DIM,
-        hidden_dim=hidden_dim_denoise_actual,
-        n_layers=3,
-        n_cond=N_PROPERTIES,
-        d_cond=128,
-        use_bias=use_bias_actual
+        input_dim=ae1_config['latent_dim'],
+        hidden_dim=dn1_config['hidden_dim'],
+        n_layers=dn1_config['n_layers'],
+        n_cond=dn1_config['n_cond'],
+        d_cond=dn1_config['d_cond'],
+        use_bias=ae1_config['use_bias']
     ).to(device)
     
+    # Create Gen2 denoiser
     denoise_gen2 = DenoiseNN(
-        input_dim=LATENT_DIM,
-        hidden_dim=hidden_dim_denoise_actual,
-        n_layers=3,
-        n_cond=N_PROPERTIES,
-        d_cond=128,
-        use_bias=use_bias_actual
+        input_dim=ae2_config['latent_dim'],
+        hidden_dim=dn2_config['hidden_dim'],
+        n_layers=dn2_config['n_layers'],
+        n_cond=dn2_config['n_cond'],
+        d_cond=dn2_config['d_cond'],
+        use_bias=ae2_config['use_bias']
     ).to(device)
     
-    # Load checkpoints (reuse ae1_ckpt_test already loaded, reuse dn1_ckpt_test)
-    autoencoder_gen1.load_state_dict(ae1_ckpt_test['state_dict'])
+    # Load checkpoints
+    print(f"  Loading Gen1 autoencoder weights...")
+    ae1_ckpt = torch.load(ae1_path, map_location=device, weights_only=False)
+    autoencoder_gen1.load_state_dict(ae1_ckpt['state_dict'])
     autoencoder_gen1.eval()
     
-    denoise_gen1.load_state_dict(dn1_ckpt_test['state_dict'])
+    print(f"  Loading Gen1 denoiser weights...")
+    dn1_ckpt = torch.load(dn1_path, map_location=device, weights_only=False)
+    denoise_gen1.load_state_dict(dn1_ckpt['state_dict'])
     denoise_gen1.eval()
     
+    print(f"  Loading Gen2 autoencoder weights...")
     ae2_ckpt = torch.load(ae2_path, map_location=device, weights_only=False)
     autoencoder_gen2.load_state_dict(ae2_ckpt['state_dict'])
     autoencoder_gen2.eval()
     
+    print(f"  Loading Gen2 denoiser weights...")
     dn2_ckpt = torch.load(dn2_path, map_location=device, weights_only=False)
     denoise_gen2.load_state_dict(dn2_ckpt['state_dict'])
     denoise_gen2.eval()
@@ -396,7 +478,7 @@ def load_models(checkpoint_dir: Path, n_nodes: int, N: int = 2500):
     return autoencoder_gen1, denoise_gen1, autoencoder_gen2, denoise_gen2, betas
 
 
-def evaluate_models(checkpoint_dir: Path, n_nodes: int, output_dir: Path, N: int = 2500, K_NEAREST: int = 100):
+def evaluate_models(checkpoint_dir: Path, n_nodes: int, output_dir: Path, N: int = 500, K_NEAREST: int = 1):
     """Run evaluation on saved models for a specific node size.
     
     Args:
@@ -625,6 +707,8 @@ def main():
                         help="Where to save evaluation results (default: checkpoint-dir with _eval suffix)")
     parser.add_argument("--node-sizes", type=int, nargs="+", default=[5, 10, 20, 30, 50, 100],
                         help="Node sizes to evaluate (default: 5 10 20 30 50 100)")
+    parser.add_argument("--N", type=int, default=500,
+                        help="Training set size used during training (default: 500)")
     parser.add_argument("--k-nearest", type=int, default=100,
                         help="Number of nearest neighbors for memorization check (default: 100)")
     parser.add_argument("--no-bias", action="store_true",
@@ -657,6 +741,7 @@ def main():
     print(f"Checkpoint dir: {checkpoint_dir}")
     print(f"Output dir: {output_dir}")
     print(f"Node sizes: {args.node_sizes}")
+    print(f"Training set size (N): {args.N}")
     print(f"Device: {device}")
     print(f"{'='*80}\n")
     
@@ -664,7 +749,7 @@ def main():
     all_results = []
     for n_nodes in args.node_sizes:
         try:
-            result = evaluate_models(checkpoint_dir, n_nodes, output_dir, K_NEAREST=args.k_nearest)
+            result = evaluate_models(checkpoint_dir, n_nodes, output_dir, N=args.N, K_NEAREST=args.k_nearest)
             all_results.append(result)
         except FileNotFoundError as e:
             print(f"\n⚠️  Skipping n={n_nodes}: {e}")

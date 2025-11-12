@@ -1137,7 +1137,7 @@ def compute_wl_similarity(G1, G2):
         graphs_pair = graph_from_networkx([G1_local, G2_local], node_labels_tag='label')
         
         # Compute WL kernel
-        wl_kernel = WeisfeilerLehman(n_iter=3, normalize=True, base_graph_kernel=VertexHistogram)
+        wl_kernel = WeisfeilerLehman(n_iter=5, normalize=True, base_graph_kernel=VertexHistogram)
         K = wl_kernel.fit_transform(graphs_pair)
         
         # Similarity is off-diagonal element

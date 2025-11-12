@@ -1429,12 +1429,13 @@ def main():
     # Optionally override module-level settings for quick experimentation
     global FIXED_N, NODE_SIZES, EPOCHS_AUTOENCODER, EPOCHS_DENOISER, TIMESTEPS, NUM_SAMPLES_PER_CONDITION, K_NEAREST, USE_BIAS
     
-    # Determine bias setting
-    USE_BIAS = not args.no_bias
+    # Determine bias setting - DEFAULT IS FALSE (no bias)
     if args.no_bias:
-        print("⚠️  Running with bias=False for all models")
+        USE_BIAS = False
+        print("⚠️  Running with bias=False (--no-bias flag)")
     else:
-        print("✓ Running with bias=True for all models (default)")
+        USE_BIAS = False  # Default: no bias
+        print("✓ Running with bias=False (default)")
     
     # Make USE_BIAS available to imported modules
     import main_comparison

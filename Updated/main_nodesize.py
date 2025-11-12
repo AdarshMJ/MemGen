@@ -50,9 +50,9 @@ from main_comparison import (
 )
 
 # Configuration
-FIXED_N = 2500  # Fixed training set size - always use 1000 graphs from S1 and S2
-NODE_SIZES = [800]  # Graph complexities to test (loop over n)
-TEST_SET_SIZE = 100  # Conditioning graphs
+FIXED_N = 500  # Fixed training set size - always use 1000 graphs from S1 and S2
+NODE_SIZES = [20,50,100,500]  # Graph complexities to test (loop over n)
+TEST_SET_SIZE = 10  # Conditioning graphs
 SPLIT_SEED = 42
 
 # Training hyperparameters (constant across all experiments)
@@ -63,10 +63,10 @@ BATCH_SIZE = 32
 LEARNING_RATE = 0.0001
 GRAD_CLIP = 1.0
 LATENT_DIM = 32
-HIDDEN_DIM_ENCODER = 32
-HIDDEN_DIM_DECODER = 64
+HIDDEN_DIM_ENCODER = 128
+HIDDEN_DIM_DECODER = 256
 HIDDEN_DIM_DENOISE = 512
-N_MAX_NODES = 800  # Maximum nodes (capped for computational feasibility)
+N_MAX_NODES = 500  # Maximum nodes (capped for computational feasibility)
 N_PROPERTIES = 15  # Updated from 18 to match labelhomgenerator (no structural/feature homophily)
 TIMESTEPS = 500
 NUM_SAMPLES_PER_CONDITION = 5
@@ -76,7 +76,7 @@ BETA_KL_WEIGHT = 0.05
 SMALL_DATASET_THRESHOLD = 50
 SMALL_DATASET_KL_WEIGHT = 0.01
 SMALL_DATASET_DROPOUT = 0.1
-USE_BIAS = True  # Default: use bias in all models (can be overridden via --no-bias)
+USE_BIAS = False  # Default: use bias in all models (can be overridden via --no-bias)
 
 # Device detection: TPU > CUDA > CPU
 USE_TPU = False
@@ -384,15 +384,18 @@ def _load_seeded_splits(s1_path, s2_path, test_path, n_nodes, test_size, seed, s
         test_indices = np.arange(len(test_graphs))
         
         print(f"  Loaded S1: {len(S1_pool)}, S2: {len(S2_pool)}, Test: {len(test_graphs)}")
-        
+        # IMPORTANT: Use unified key names expected by main_comparison.create_splits
         return {
-            'S1': S1_pool,
-            'S2': S2_pool,
-            'test_graphs': test_graphs,
-            'test_stats_cache': None,
+            'S1_pool': S1_pool,
             'S1_indices': S1_indices,
+            'S2_pool': S2_pool,
             'S2_indices': S2_indices,
-            'test_indices': test_indices
+            'test_graphs': test_graphs,
+            'test_indices': test_indices,
+            'test_stats_cache': None,
+            'seed': seed,
+            'test_size': test_size,
+            'permutation': None
         }
     
     # Cache miss: load and convert from raw format
@@ -1191,32 +1194,27 @@ def create_aggregate_visualizations(all_results, output_dir):
         # Plot overlapping histograms (normalized) instead of KDE
         bins = np.linspace(0, 1, 21)
         if len(mem_scores) > 0:
-            ax.hist(mem_scores, bins=bins, alpha=0.5, color='orange', label='Memorization', density=True, edgecolor='black')
+            ax.hist(mem_scores, bins=bins, alpha=0.5, color='orange', label='Sample vs Closest Training Graph', density=True, edgecolor='black')
         if len(gen_scores) > 0:
-            ax.hist(gen_scores, bins=bins, alpha=0.5, color='blue', label='Generalization', density=True, edgecolor='black')
-        
-        # Add mean lines
-        gen_mean = np.mean(gen_scores)
-        mem_mean = np.mean(mem_scores)
-        ax.axvline(gen_mean, color='darkblue', linestyle='--', linewidth=2.5, alpha=0.9)
-        ax.axvline(mem_mean, color='darkorange', linestyle='--', linewidth=2.5, alpha=0.9)
-        
-        # Add text annotations showing means
-        ax.text(gen_mean, ax.get_ylim()[1]*0.9, f'{gen_mean:.2f}', 
-                ha='center', fontsize=12, color='darkblue', fontweight='bold',
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-        ax.text(mem_mean, ax.get_ylim()[1]*0.8, f'{mem_mean:.2f}', 
-                ha='center', fontsize=12, color='darkorange', fontweight='bold',
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            ax.hist(gen_scores, bins=bins, alpha=0.5, color='blue', label='Samples from Two Denoisers', density=True, edgecolor='black')
+        # Add node count inside each subplot (top-left)
+        ax.text(0.02, 0.95, f"n = {n_nodes}", transform=ax.transAxes, va='top', ha='left', fontsize=16,
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.7, edgecolor='none'))
         
         ax.set_xlabel('WL Similarity', fontsize=25)
         ax.set_ylabel('Density', fontsize=25)
         ax.set_xlim(0, 1)
         ax.tick_params(axis='both', labelsize=14)
-        if idx == 0:
-            ax.legend(fontsize=12, loc='upper left')
+    
+    # Create a single legend as a running block on top of the figure
+    from matplotlib.patches import Patch
+    legend_handles = [
+        Patch(facecolor='blue', edgecolor='black', alpha=0.5, label='Samples from Two Denoisers'),
+        Patch(facecolor='orange', edgecolor='black', alpha=0.5, label='Sample vs Closest Training Graph')
+    ]
+    fig.legend(handles=legend_handles, loc='upper center', bbox_to_anchor=(0.5, 1.06), ncol=2, frameon=True, fontsize=14)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(fig_dir / 'memorization_to_generalization_histograms.png', dpi=300, bbox_inches='tight')
     print(f"Saved: {fig_dir / 'memorization_to_generalization_histograms.png'}")
     plt.close()
@@ -1382,7 +1380,7 @@ def main():
                        help='Override diffusion timesteps')
     parser.add_argument('--node-sizes', type=str, default=None,
                        help='Comma-separated list of node sizes to run (e.g., "10,30,50")')
-    parser.add_argument('--k-nearest', type=int, default=100,
+    parser.add_argument('--k-nearest', type=int, default=1,
                        help='Use k-nearest shortlist for training matching (degree-hist prefilter)')
     parser.add_argument('--use-pre-splits', action='store_true',
                        help='If present, load S1/S2/test pickles saved next to the pooled dataset instead of shuffling internally.')

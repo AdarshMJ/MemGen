@@ -16,7 +16,7 @@ import scipy as sp
 import torch
 import networkx as nx
 import matplotlib
-matplotlib.use('Agg')
+#matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from torch_geometric.data import Data
 from torch_geometric.datasets import Planetoid
@@ -408,6 +408,131 @@ def generate_single_graph(
     raise RuntimeError("Graph sampling failed after multiple retries.")
 
 
+def compute_wl_similarity(graphs: List[Tuple[Data, Dict[str, float]]], n_iter: int = 3) -> float:
+    """Compute average pairwise WL similarity within a set of graphs.
+    
+    Args:
+        graphs: List of (Data, meta) tuples
+        n_iter: Number of WL iterations
+        
+    Returns:
+        Average pairwise WL similarity (0-1, higher = more similar)
+    """
+    try:
+        from grakel import Graph as GrakelGraph
+        from grakel.kernels import WeisfeilerLehman, VertexHistogram
+        
+        # Convert to grakel format
+        grakel_graphs = []
+        for data, _ in graphs:
+            edges = data.edge_index.t().tolist()
+            n = int(data.num_nodes)
+            edge_dict = {i: [] for i in range(n)}
+            for u, v in edges:
+                u, v = int(u), int(v)
+                if u != v:
+                    edge_dict[u].append(v)
+                    edge_dict[v].append(u)
+            node_labels = {i: 0 for i in range(n)}  # uniform labels for structure
+            grakel_graphs.append(GrakelGraph(edge_dict, node_labels=node_labels))
+        
+        # Compute WL kernel
+        wl_kernel = WeisfeilerLehman(n_iter=n_iter, base_graph_kernel=VertexHistogram, normalize=True)
+        K = wl_kernel.fit_transform(grakel_graphs)
+        
+        # Average off-diagonal similarities
+        n_graphs = len(graphs)
+        if n_graphs < 2:
+            return 0.0
+        similarities = []
+        for i in range(n_graphs):
+            for j in range(i + 1, n_graphs):
+                similarities.append(K[i, j])
+        
+        return float(np.mean(similarities)) if similarities else 0.0
+    except Exception as e:
+        print(f"Warning: WL similarity computation failed: {e}")
+        return 0.0
+
+
+def compute_pairwise_diversity(graphs: List[Tuple[Data, Dict[str, float]]], metric: str = 'homophily') -> float:
+    """Compute diversity within a set of graphs.
+    
+    Args:
+        graphs: List of (Data, meta) tuples
+        metric: 'homophily' (std of homophily) or 'wl' (1 - WL similarity)
+        
+    Returns:
+        Diversity score (higher = more diverse)
+    """
+    if metric == 'homophily':
+        homs = [meta.get('realised_label_hom', 0.5) for _, meta in graphs]
+        return float(np.std(homs))
+    elif metric == 'wl':
+        sim = compute_wl_similarity(graphs, n_iter=3)
+        return 1.0 - sim
+    else:
+        raise ValueError(f"Unknown metric: {metric}")
+
+
+def compute_cross_diversity(graphs1: List[Tuple[Data, Dict[str, float]]], 
+                           graphs2: List[Tuple[Data, Dict[str, float]]], 
+                           metric: str = 'homophily') -> float:
+    """Compute diversity between two sets of graphs.
+    
+    Args:
+        graphs1, graphs2: Lists of (Data, meta) tuples
+        metric: 'homophily' (difference of means) or 'wl' (1 - cross-WL similarity)
+        
+    Returns:
+        Cross-diversity score (higher = more diverse)
+    """
+    if metric == 'homophily':
+        homs1 = [meta.get('realised_label_hom', 0.5) for _, meta in graphs1]
+        homs2 = [meta.get('realised_label_hom', 0.5) for _, meta in graphs2]
+        return abs(float(np.mean(homs1)) - float(np.mean(homs2)))
+    elif metric == 'wl':
+        # Compute cross-similarity
+        try:
+            from grakel import Graph as GrakelGraph
+            from grakel.kernels import WeisfeilerLehman, VertexHistogram
+            
+            # Convert both sets to grakel
+            all_graphs = graphs1 + graphs2
+            grakel_graphs = []
+            for data, _ in all_graphs:
+                edges = data.edge_index.t().tolist()
+                n = int(data.num_nodes)
+                edge_dict = {i: [] for i in range(n)}
+                for u, v in edges:
+                    u, v = int(u), int(v)
+                    if u != v:
+                        edge_dict[u].append(v)
+                        edge_dict[v].append(u)
+                node_labels = {i: 0 for i in range(n)}
+                grakel_graphs.append(GrakelGraph(edge_dict, node_labels=node_labels))
+            
+            # Compute WL kernel
+            wl_kernel = WeisfeilerLehman(n_iter=3, base_graph_kernel=VertexHistogram, normalize=True)
+            K = wl_kernel.fit_transform(grakel_graphs)
+            
+            # Average cross similarities
+            n1 = len(graphs1)
+            n2 = len(graphs2)
+            cross_sims = []
+            for i in range(n1):
+                for j in range(n2):
+                    cross_sims.append(K[i, n1 + j])
+            
+            avg_cross_sim = float(np.mean(cross_sims)) if cross_sims else 0.0
+            return 1.0 - avg_cross_sim
+        except Exception as e:
+            print(f"Warning: Cross WL diversity computation failed: {e}")
+            return 0.0
+    else:
+        raise ValueError(f"Unknown metric: {metric}")
+
+
 def generate_dataset_splits(
     templates: Sequence[SeedStats],
     node_size: int,
@@ -419,6 +544,10 @@ def generate_dataset_splits(
     spectral_dim: int = 10,
     n_max_nodes: int = 100,
 ) -> Dict[str, List[Tuple[Data, Dict[str, float]]]]:
+    """Legacy function: generates splits with identical parameters (NO diversity).
+    
+    For diverse splits, use generate_dataset_splits_diverse() instead.
+    """
     required = 2 * train_per_set + test_count
     if total_graphs < required:
         raise ValueError(f"Need at least {required} graphs, received {total_graphs}")
@@ -446,6 +575,160 @@ def generate_dataset_splits(
     return {"S1": s1, "S2": s2, "test": test, "extra": extra}
 
 
+def generate_dataset_splits_diverse(
+    templates: Sequence[SeedStats],
+    node_size: int,
+    train_per_set: int,
+    test_count: int,
+    s1_config: Dict,
+    s2_config: Dict,
+    test_config: Dict,
+    spectral_dim: int = 10,
+    n_max_nodes: int = 100,
+    validate_diversity: bool = True,
+    diversity_margin: float = 0.15,
+    validation_sample_size: int = 100,
+) -> Dict[str, List[Tuple[Data, Dict[str, float]]]]:
+    """Generate dataset splits with DIVERSE S1 and S2 configurations.
+    
+    Args:
+        templates: List of seed graph statistics (e.g., Cora, CiteSeer)
+        node_size: Number of nodes per graph
+        train_per_set: Number of graphs per training split (S1/S2)
+        test_count: Number of test graphs
+        s1_config: Config for S1 split, e.g. {'target_hom_range': [0.65, 0.95], 'jitter': 0.1, 'templates': [0]}
+        s2_config: Config for S2 split, e.g. {'target_hom_range': [0.15, 0.45], 'jitter': 0.1, 'templates': [1]}
+        test_config: Config for test split, e.g. {'target_hom_range': [0.4, 0.6], 'jitter': 0.1, 'templates': None}
+        spectral_dim: Number of Laplacian eigenvectors for node features
+        n_max_nodes: Max nodes for degree normalization
+        validate_diversity: Whether to validate diversity constraints during generation
+        diversity_margin: Minimum required gap: cross_diversity > within_diversity + margin
+        validation_sample_size: Sample size for diversity validation
+        
+    Returns:
+        Dictionary with splits: {'S1': [...], 'S2': [...], 'test': [...]}
+        
+    Config format:
+        - target_hom_range: [low, high] homophily range (will sample uniformly)
+        - jitter: Dirichlet noise level for pair probabilities
+        - templates: List of template indices to use (None = all templates)
+    """
+    print(f"\n=== Generating DIVERSE splits for n={node_size} ===")
+    print(f"S1 config: {s1_config}")
+    print(f"S2 config: {s2_config}")
+    print(f"Test config: {test_config}")
+    print(f"Validation: {'ENABLED' if validate_diversity else 'DISABLED'} (margin={diversity_margin})")
+    
+    def generate_split(config: Dict, count: int, split_name: str) -> List[Tuple[Data, Dict[str, float]]]:
+        """Generate graphs for a single split with given configuration."""
+        hom_range = config.get('target_hom_range', [0.4, 0.6])
+        jitter = config.get('jitter', 0.1)
+        template_indices = config.get('templates', None)
+        
+        # Filter templates if specified
+        if template_indices is not None:
+            split_templates = [templates[i] for i in template_indices if i < len(templates)]
+        else:
+            split_templates = list(templates)
+        
+        if not split_templates:
+            raise ValueError(f"No valid templates for {split_name}")
+        
+        graphs = []
+        while len(graphs) < count:
+            # Sample homophily uniformly from range
+            target_hom = random.uniform(hom_range[0], hom_range[1])
+            
+            graph, meta = generate_single_graph(
+                templates=split_templates,
+                n=node_size,
+                target_hom=target_hom,
+                jitter=jitter,
+                spectral_dim=spectral_dim,
+                n_max_nodes=n_max_nodes,
+            )
+            graphs.append((graph, meta))
+            
+            if len(graphs) % 200 == 0:
+                print(f"  {split_name}: generated {len(graphs)} / {count} graphs")
+        
+        return graphs
+    
+    # Generate S1
+    print(f"\nGenerating S1 ({train_per_set} graphs)...")
+    s1_graphs = generate_split(s1_config, train_per_set, "S1")
+    
+    # Generate S2
+    print(f"\nGenerating S2 ({train_per_set} graphs)...")
+    s2_graphs = generate_split(s2_config, train_per_set, "S2")
+    
+    # Generate test
+    print(f"\nGenerating test ({test_count} graphs)...")
+    test_graphs = generate_split(test_config, test_count, "test")
+    
+    # Validate diversity constraints
+    if validate_diversity:
+        print(f"\n=== Validating diversity constraints ===")
+        
+        # Sample for validation (full set too expensive)
+        val_size = min(validation_sample_size, train_per_set)
+        s1_sample = random.sample(s1_graphs, val_size)
+        s2_sample = random.sample(s2_graphs, val_size)
+        
+        # Compute diversity metrics
+        print("Computing within-split diversity (homophily std)...")
+        s1_within_hom = compute_pairwise_diversity(s1_sample, metric='homophily')
+        s2_within_hom = compute_pairwise_diversity(s2_sample, metric='homophily')
+        
+        print("Computing cross-split diversity (homophily difference)...")
+        cross_hom = compute_cross_diversity(s1_sample, s2_sample, metric='homophily')
+        
+        avg_within_hom = (s1_within_hom + s2_within_hom) / 2.0
+        margin_hom = cross_hom - avg_within_hom
+        
+        print(f"\n--- Homophily Diversity ---")
+        print(f"S1 within (std): {s1_within_hom:.4f}")
+        print(f"S2 within (std): {s2_within_hom:.4f}")
+        print(f"Avg within: {avg_within_hom:.4f}")
+        print(f"Cross (|mean diff|): {cross_hom:.4f}")
+        print(f"Margin: {margin_hom:.4f} (target: >{diversity_margin:.2f})")
+        
+        if margin_hom < diversity_margin:
+            print(f"⚠️  WARNING: Homophily margin {margin_hom:.4f} < {diversity_margin:.2f}")
+            print(f"    Consider adjusting target_hom_range configs")
+        else:
+            print(f"✓ Homophily diversity constraint satisfied!")
+        
+        # Optional: WL diversity (expensive, only for small samples)
+        if val_size <= 50:
+            print("\nComputing WL diversity (may take a while)...")
+            try:
+                s1_within_wl = compute_pairwise_diversity(s1_sample, metric='wl')
+                s2_within_wl = compute_pairwise_diversity(s2_sample, metric='wl')
+                cross_wl = compute_cross_diversity(s1_sample, s2_sample, metric='wl')
+                
+                avg_within_wl = (s1_within_wl + s2_within_wl) / 2.0
+                margin_wl = cross_wl - avg_within_wl
+                
+                print(f"\n--- WL Diversity ---")
+                print(f"S1 within (1-sim): {s1_within_wl:.4f}")
+                print(f"S2 within (1-sim): {s2_within_wl:.4f}")
+                print(f"Avg within: {avg_within_wl:.4f}")
+                print(f"Cross (1-sim): {cross_wl:.4f}")
+                print(f"Margin: {margin_wl:.4f}")
+                
+                if margin_wl < 0.05:  # Lower threshold for WL
+                    print(f"⚠️  WARNING: WL margin {margin_wl:.4f} is low")
+                else:
+                    print(f"✓ WL diversity looks good!")
+            except Exception as e:
+                print(f"WL diversity computation failed (non-critical): {e}")
+        
+        print("\n" + "="*50)
+    
+    return {"S1": s1_graphs, "S2": s2_graphs, "test": test_graphs}
+
+
 def save_split(output_dir: str, node_size: int, split: Dict[str, List[Tuple[Data, Dict[str, float]]]]) -> None:
     os.makedirs(output_dir, exist_ok=True)
     base_dir = os.path.join(output_dir, f"node_{node_size}")
@@ -469,7 +752,7 @@ def save_split(output_dir: str, node_size: int, split: Dict[str, List[Tuple[Data
         json.dump(summary, handle, indent=2)
 
 
-def visualize_examples(output_dir: str, node_size: int, n_examples: int = 6, layout: str = 'spring') -> None:
+def visualize_examples(output_dir: str, node_size: int, n_examples: int = 3, layout: str = 'spring') -> None:
     """Load saved split for node_size and render a few example graphs colored by labels.
 
     This writes a PNG image into the split directory called `examples_node_{n}.png`.
@@ -489,6 +772,7 @@ def visualize_examples(output_dir: str, node_size: int, n_examples: int = 6, lay
     take = min(n_examples, len(entries))
     chosen = random.sample(entries, take)
 
+    # Use a compact figure size so lines remain visible even when preview downscales
     fig, axes = plt.subplots(1, take, figsize=(4 * take, 4))
     if take == 1:
         axes = [axes]
@@ -513,25 +797,83 @@ def visualize_examples(output_dir: str, node_size: int, n_examples: int = 6, lay
         else:
             # map unique labels to colors
             uniq = sorted(set(labels))
-            cmap = plt.get_cmap('tab10')
-            color_map = {lab: cmap(i % 10) for i, lab in enumerate(uniq)}
+            cmap = plt.get_cmap('Set1')  # More vibrant colors
+            color_map = {lab: cmap(i % 9) for i, lab in enumerate(uniq)}
             node_colors = [color_map[int(l)] for l in labels]
 
-        if layout == 'spring':
-            pos = nx.spring_layout(G, seed=42)
-        elif layout == 'circular':
-            pos = nx.circular_layout(G)
-        else:
-            pos = nx.spring_layout(G, seed=42)
+        # Choose layout - use different strategies for sparse vs dense graphs
+        avg_degree = 2 * G.number_of_edges() / n if n > 0 else 0
+        
+        try:
+            if avg_degree < 3.0 or layout == 'kamada_kawai':
+                # For sparse graphs, kamada_kawai works much better
+                pos = nx.kamada_kawai_layout(G, scale=1.0)
+            elif layout == 'circular':
+                pos = nx.circular_layout(G, scale=1.0)
+            else:
+                # Spring layout with very aggressive parameters for sparse graphs
+                k_param = max(0.5, 2.0/np.sqrt(n))  # Much higher k for more spacing
+                pos = nx.spring_layout(G, k=k_param, iterations=200, seed=42, scale=1.0)
+            
+            # Check if layout collapsed (all positions too close)
+            if pos:
+                # Preserve node->position mapping while normalizing
+                node_order = list(G.nodes())
+                coords = np.array([pos[node] for node in node_order], dtype=float)
+                # Normalize to [-1, 1]
+                mins = coords.min(axis=0)
+                maxs = coords.max(axis=0)
+                spans = np.maximum(maxs - mins, 1e-8)
+                coords = (coords - mins) / spans  # [0,1]
+                coords = 2.0 * coords - 1.0       # [-1,1]
+                pos = {node: (float(coords[i, 0]), float(coords[i, 1])) for i, node in enumerate(node_order)}
 
-        nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=80, ax=ax)
-        nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.6)
-        ax.set_title(f"{meta.get('seed','?')} n={n} e={meta.get('num_edges',0)} hom={meta.get('realised_label_hom',0):.2f}")
+                # If still nearly-degenerate, force a circular layout
+                if float(np.std(coords)) < 1e-3:
+                    theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
+                    R = 1.0
+                    pos = {node: (float(R * np.cos(theta[i])), float(R * np.sin(theta[i]))) for i, node in enumerate(node_order)}
+        except Exception as e:
+            # Fallback to circular if layout fails
+            print(f"  Layout failed ({e}), using circular fallback")
+            pos = nx.circular_layout(G, scale=1.0)
+
+        # Add tiny jitter to avoid accidental overlap from identical coords
+        jitter = 0.02
+        pos = {k: (v[0] + np.random.uniform(-jitter, jitter), v[1] + np.random.uniform(-jitter, jitter)) for k, v in pos.items()}
+
+        # Draw edges FIRST so nodes appear on top
+        # Use thick, dark edges so they survive Preview.app downscaling
+        edge_width = max(6.0, 160.0 / max(n, 1))  # >=6pt, thicker for tiny graphs
+        nx.draw_networkx_edges(
+            G, pos, ax=ax, alpha=0.95, width=edge_width, edge_color='black',
+            style='solid'
+        )
+
+        # Moderate node size so edges remain visible
+        node_sz = max(250, min(700, 8000 // max(n, 1)))
+        nx.draw_networkx_nodes(
+            G, pos, node_color=node_colors, node_size=node_sz, ax=ax,
+            edgecolors='black', linewidths=1.2, alpha=0.95
+        )
+
+        # Add node labels for small graphs
+        if n <= 30:
+            nx.draw_networkx_labels(G, pos, ax=ax, font_size=9, font_weight='bold')
+
+        # Add title with key metrics
+        title = f"{meta.get('seed','?')} n={n} e={meta.get('num_edges',0)} hom={meta.get('realised_label_hom',0):.2f}"
+        ax.set_title(title, fontsize=14, pad=10, weight='bold')
         ax.set_axis_off()
 
+        # Set equal aspect ratio and fixed limits to ensure visibility
+        ax.set_aspect('equal')
+        ax.set_xlim(-1.2, 1.2)
+        ax.set_ylim(-1.2, 1.2)
+
     out_path = os.path.join(base_dir, f"examples_node_{node_size}.png")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200, bbox_inches='tight')
+    plt.tight_layout(pad=0.5)
+    plt.savefig(out_path, dpi=200, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"Saved examples to {out_path}")
 
@@ -540,16 +882,29 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fast seeded synthetic graph dataset generator")
     parser.add_argument("--output-dir", type=str, required=True, help="Destination directory for generated splits")
     parser.add_argument("--node-sizes", type=int, nargs="+", default=[100], help="Node counts to generate")
-    parser.add_argument("--total-per-size", type=int, default=5100, help="Graphs to sample per node size")
+    parser.add_argument("--total-per-size", type=int, default=5100, help="Graphs to sample per node size (legacy mode only)")
     parser.add_argument("--train-per-set", type=int, default=2500, help="Graphs per training subset")
     parser.add_argument("--test-count", type=int, default=100, help="Graphs reserved for evaluation")
-    parser.add_argument("--target-hom", type=float, default=0.5, help="Desired label homophily")
+    parser.add_argument("--target-hom", type=float, default=0.5, help="Desired label homophily (legacy mode only)")
     parser.add_argument("--pair-jitter", type=float, default=0.1, help="Dirichlet noise level for pair probabilities")
     parser.add_argument("--planetoid-root", type=str, default="./planetoid", help="Planetoid dataset root directory")
     parser.add_argument("--visualize", action="store_true", help="Generate example visualizations after creating splits")
-    parser.add_argument("--viz-examples", type=int, default=6, help="Number of example graphs to visualize (default: 6)")
+    parser.add_argument("--viz-examples", type=int, default=3, help="Number of example graphs to visualize (default: 3)")
     parser.add_argument("--spectral-dim", type=int, default=10, help="Number of Laplacian eigenvectors to use as node features (default: 10)")
     parser.add_argument("--n-max-nodes", type=int, default=100, help="Maximum number of nodes for degree normalization (default: 100)")
+    
+    # Diverse split generation mode
+    parser.add_argument("--diverse", action="store_true", help="Enable diverse split generation (S1 and S2 have different configs)")
+    parser.add_argument("--s1-hom-range", type=float, nargs=2, default=[0.65, 0.95], help="S1 homophily range [low, high] (diverse mode)")
+    parser.add_argument("--s2-hom-range", type=float, nargs=2, default=[0.15, 0.45], help="S2 homophily range [low, high] (diverse mode)")
+    parser.add_argument("--test-hom-range", type=float, nargs=2, default=[0.4, 0.6], help="Test homophily range [low, high] (diverse mode)")
+    parser.add_argument("--s1-templates", type=int, nargs="*", default=None, help="Template indices for S1 (diverse mode, None=all)")
+    parser.add_argument("--s2-templates", type=int, nargs="*", default=None, help="Template indices for S2 (diverse mode, None=all)")
+    parser.add_argument("--test-templates", type=int, nargs="*", default=None, help="Template indices for test (diverse mode, None=all)")
+    parser.add_argument("--validate-diversity", action="store_true", help="Validate diversity constraints during generation (diverse mode)")
+    parser.add_argument("--diversity-margin", type=float, default=0.15, help="Minimum cross-within diversity gap (diverse mode)")
+    parser.add_argument("--validation-sample-size", type=int, default=100, help="Sample size for diversity validation (diverse mode)")
+    
     return parser.parse_args()
 
 
@@ -563,26 +918,81 @@ def main() -> None:
         load_seed_stats("CiteSeer", args.planetoid_root),
     ]
 
-    for node_size in args.node_sizes:
-        print(f"Generating node size {node_size}...")
-        split = generate_dataset_splits(
-            templates=templates,
-            node_size=node_size,
-            total_graphs=args.total_per_size,
-            train_per_set=args.train_per_set,
-            test_count=args.test_count,
-            target_hom=args.target_hom,
-            jitter=args.pair_jitter,
-            spectral_dim=args.spectral_dim,
-            n_max_nodes=args.n_max_nodes,
-        )
-        save_split(args.output_dir, node_size, split)
-        print(f"Finished node size {node_size} -> {args.output_dir}/node_{node_size}")
+    if args.diverse:
+        # DIVERSE MODE: S1 and S2 have different configurations
+        print("\n" + "="*70)
+        print("DIVERSE SPLIT GENERATION MODE ENABLED")
+        print("="*70)
         
-        # Auto-visualize if requested
-        if args.visualize:
-            print(f"Creating visualizations for node size {node_size}...")
-            visualize_examples(args.output_dir, node_size, n_examples=args.viz_examples, layout='spring')
+        s1_config = {
+            'target_hom_range': args.s1_hom_range,
+            'jitter': args.pair_jitter,
+            'templates': args.s1_templates,
+        }
+        s2_config = {
+            'target_hom_range': args.s2_hom_range,
+            'jitter': args.pair_jitter,
+            'templates': args.s2_templates,
+        }
+        test_config = {
+            'target_hom_range': args.test_hom_range,
+            'jitter': args.pair_jitter,
+            'templates': args.test_templates,
+        }
+        
+        for node_size in args.node_sizes:
+            print(f"\n{'='*70}")
+            print(f"Generating DIVERSE splits for node size {node_size}...")
+            print(f"{'='*70}")
+            
+            split = generate_dataset_splits_diverse(
+                templates=templates,
+                node_size=node_size,
+                train_per_set=args.train_per_set,
+                test_count=args.test_count,
+                s1_config=s1_config,
+                s2_config=s2_config,
+                test_config=test_config,
+                spectral_dim=args.spectral_dim,
+                n_max_nodes=args.n_max_nodes,
+                validate_diversity=args.validate_diversity,
+                diversity_margin=args.diversity_margin,
+                validation_sample_size=args.validation_sample_size,
+            )
+            
+            save_split(args.output_dir, node_size, split)
+            print(f"\n✓ Finished node size {node_size} -> {args.output_dir}/node_{node_size}")
+            
+            if args.visualize:
+                print(f"Creating visualizations for node size {node_size}...")
+                visualize_examples(args.output_dir, node_size, n_examples=args.viz_examples, layout='spring')
+    else:
+        # LEGACY MODE: Identical parameters for S1 and S2
+        print("\n" + "="*70)
+        print("LEGACY MODE: Generating splits with IDENTICAL parameters")
+        print("WARNING: This may cause S1↔S2 convergence at large n")
+        print("Use --diverse flag for diverse split generation")
+        print("="*70)
+        
+        for node_size in args.node_sizes:
+            print(f"\nGenerating node size {node_size}...")
+            split = generate_dataset_splits(
+                templates=templates,
+                node_size=node_size,
+                total_graphs=args.total_per_size,
+                train_per_set=args.train_per_set,
+                test_count=args.test_count,
+                target_hom=args.target_hom,
+                jitter=args.pair_jitter,
+                spectral_dim=args.spectral_dim,
+                n_max_nodes=args.n_max_nodes,
+            )
+            save_split(args.output_dir, node_size, split)
+            print(f"Finished node size {node_size} -> {args.output_dir}/node_{node_size}")
+            
+            if args.visualize:
+                print(f"Creating visualizations for node size {node_size}...")
+                visualize_examples(args.output_dir, node_size, n_examples=args.viz_examples, layout='spring')
 
 
 

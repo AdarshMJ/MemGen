@@ -567,7 +567,6 @@ def _load_precomputed_splits(n_nodes, data_path, test_size, seed, stats_cache_pa
 
 def train_autoencoder(data_list, run_name, output_dir):
     """Train VGAE (imported logic from main_comparison.py)."""
-    import main_comparison
     
     # Inject hyperparameters from main_nodesize into main_comparison module
     main_comparison.BETA_KL_WEIGHT = BETA_KL_WEIGHT
@@ -587,6 +586,7 @@ def train_autoencoder(data_list, run_name, output_dir):
     main_comparison.GRAD_CLIP = GRAD_CLIP
     main_comparison.BATCH_SIZE = BATCH_SIZE
     main_comparison.N_MAX_NODES = N_MAX_NODES
+    main_comparison.USE_BIAS = USE_BIAS  # Critical: pass bias setting
     
     return main_comparison.train_autoencoder(data_list, run_name, output_dir)
 
@@ -603,6 +603,7 @@ def train_denoiser(autoencoder, data_list, run_name, output_dir):
     main_comparison.GRAD_CLIP = GRAD_CLIP
     main_comparison.BATCH_SIZE = BATCH_SIZE
     main_comparison.EARLY_STOPPING_PATIENCE = EARLY_STOPPING_PATIENCE
+    main_comparison.USE_BIAS = USE_BIAS  # Critical: pass bias setting
     
     return main_comparison.train_denoiser(autoencoder, data_list, run_name, output_dir)
 

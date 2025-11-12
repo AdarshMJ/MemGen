@@ -46,10 +46,16 @@ TEST_SET_SIZE = 100  # Number of conditioning graphs held out from both models
 SPLIT_SEED = 42  # Reproducible shuffle before creating S1/S2/test splits
 NUM_SAMPLES_PER_CONDITION = 5  # Number of samples to draw per model per conditioning vector
 KS_SIGNIFICANCE_THRESHOLD = 0.05  # Significance level for KS tests comparing S1/S2 statistics
-BETA_KL_WEIGHT = 0.05
+BETA_KL_WEIGHT = 0.5  # Increased from 0.05 to prevent posterior collapse
 SMALL_DATASET_THRESHOLD = 50
-SMALL_DATASET_KL_WEIGHT = 0.01
+SMALL_DATASET_KL_WEIGHT = 1.0  # Increased from 0.2 - small datasets need stronger KL penalty
 SMALL_DATASET_DROPOUT = 0.1
+LAMBDA_DIVERSITY = 0.5  # Spectral diversity regularization to prevent collapse
+
+# β-Annealing parameters (prevents posterior collapse)
+BETA_ANNEALING = True  # Enable gradual beta increase
+BETA_START = 0.0  # Start with pure reconstruction
+BETA_ANNEAL_EPOCHS = 50  # Gradually increase beta over first 50 epochs
 
 # Training hyperparameters - KEPT CONSTANT ACROSS ALL N VALUES
 # This ensures no hidden confounders - only training set size varies
@@ -97,6 +103,34 @@ def optimizer_step(optimizer):
         xm.optimizer_step(optimizer)
     else:
         optimizer.step()
+
+
+def get_beta_value(epoch, beta_target, enable_annealing=True):
+    """
+    Get beta value with optional annealing schedule.
+    
+    Gradually increases beta from BETA_START to beta_target over BETA_ANNEAL_EPOCHS.
+    This prevents posterior collapse by allowing the encoder to learn meaningful
+    representations before the KL term dominates.
+    
+    Args:
+        epoch: Current training epoch (1-indexed)
+        beta_target: Target beta value to reach after annealing
+        enable_annealing: Whether to use annealing (if False, returns beta_target)
+    
+    Returns:
+        Current beta value for this epoch
+    """
+    if not enable_annealing or not BETA_ANNEALING:
+        return beta_target
+    
+    if epoch <= BETA_ANNEAL_EPOCHS:
+        # Linear annealing from BETA_START to beta_target
+        progress = (epoch - 1) / BETA_ANNEAL_EPOCHS
+        beta = BETA_START + (beta_target - BETA_START) * progress
+        return beta
+    else:
+        return beta_target
 
 
 def load_dataset(data_path='data/labelhomophily0.5_10nodes_graphs.pkl'):
@@ -594,11 +628,16 @@ def train_autoencoder(data_list, run_name, output_dir):
     ).to(device)
     
     dataset_size = len(data_list)
-    beta_value = BETA_KL_WEIGHT
+    beta_target = BETA_KL_WEIGHT
     if dataset_size <= SMALL_DATASET_THRESHOLD:
-        beta_value = SMALL_DATASET_KL_WEIGHT
+        beta_target = SMALL_DATASET_KL_WEIGHT
         autoencoder.encoder.dropout = SMALL_DATASET_DROPOUT
-        print(f"Small dataset detected ({dataset_size} graphs) → KL beta set to {beta_value}, encoder dropout={SMALL_DATASET_DROPOUT}")
+        print(f"Small dataset detected ({dataset_size} graphs) → Target KL beta: {beta_target}, encoder dropout={SMALL_DATASET_DROPOUT}")
+    
+    if BETA_ANNEALING:
+        print(f"β-annealing enabled: {BETA_START} → {beta_target} over {BETA_ANNEAL_EPOCHS} epochs")
+    else:
+        print(f"β-annealing disabled: using constant beta={beta_target}")
     
     optimizer = torch.optim.Adam(autoencoder.parameters(), lr=LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
@@ -627,6 +666,9 @@ def train_autoencoder(data_list, run_name, output_dir):
     edges_per_graph = N_MAX_NODES * N_MAX_NODES
 
     for epoch in range(1, EPOCHS_AUTOENCODER + 1):
+        # Get current beta value (annealed or constant)
+        beta_value = get_beta_value(epoch, beta_target, enable_annealing=BETA_ANNEALING)
+        
         autoencoder.train()
         
         train_loss_all = 0
@@ -637,7 +679,7 @@ def train_autoencoder(data_list, run_name, output_dir):
         for data in train_loader:
             data = data.to(device)
             optimizer.zero_grad()
-            loss, recon, kld = autoencoder.loss_function(data, beta=beta_value)
+            loss, recon, kld = autoencoder.loss_function(data, beta=beta_value, lambda_diversity=LAMBDA_DIVERSITY)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(autoencoder.parameters(), GRAD_CLIP)
             train_loss_all += loss.item()
@@ -656,7 +698,7 @@ def train_autoencoder(data_list, run_name, output_dir):
         with torch.no_grad():
             for data in val_loader:
                 data = data.to(device)
-                loss, recon, kld = autoencoder.loss_function(data, beta=beta_value)
+                loss, recon, kld = autoencoder.loss_function(data, beta=beta_value, lambda_diversity=LAMBDA_DIVERSITY)
                 val_loss_all += loss.item()
                 val_recon_sum += recon.item()
                 val_kld_sum += kld.item()
@@ -668,12 +710,50 @@ def train_autoencoder(data_list, run_name, output_dir):
         val_recon_avg = val_recon_sum / val_count if val_count else np.nan
         train_per_edge = train_recon_avg / edges_per_graph if np.isfinite(train_recon_avg) else np.nan
         val_per_edge = val_recon_avg / edges_per_graph if np.isfinite(val_recon_avg) else np.nan
+        train_kld_avg = train_kld_sum / train_count if train_count else np.nan
+        val_kld_avg = val_kld_sum / val_count if val_count else np.nan
 
         if epoch % 20 == 0 or epoch == 1:
             print(
-                f"Epoch {epoch:03d}: Train Loss: {train_loss_avg:.2f} | Val Loss: {val_loss_avg:.2f} "
-                f"(per-edge train MAE {train_per_edge:.4f}, val MAE {val_per_edge:.4f})"
+                f"Epoch {epoch:03d} [β={beta_value:.3f}]: "
+                f"Train Loss: {train_loss_avg:.2f} (Recon: {train_recon_avg:.2f}, KLD: {train_kld_avg:.2f}) | "
+                f"Val Loss: {val_loss_avg:.2f} (Recon: {val_recon_avg:.2f}, KLD: {val_kld_avg:.2f})"
             )
+            
+            # Latent space diagnostics every 20 epochs (detect collapse early)
+            if epoch % 20 == 0:
+                with torch.no_grad():
+                    z_samples = []
+                    for batch in val_loader:
+                        batch = batch.to(device)
+                        # Get mu and logvar directly (same as loss_function)
+                        x_g = autoencoder.encoder(batch)
+                        mu = autoencoder.fc_mu(x_g)
+                        logvar = autoencoder.fc_logvar(x_g)
+                        z = autoencoder.reparameterize(mu, logvar)
+                        z_samples.append(z.cpu())
+                    
+                    if len(z_samples) > 0:
+                        z_all = torch.cat(z_samples, dim=0).numpy()
+                        
+                        # Quick PCA check
+                        from sklearn.decomposition import PCA
+                        n_components = min(5, z_all.shape[0], z_all.shape[1])
+                        if n_components >= 2:
+                            pca = PCA(n_components=n_components)
+                            pca.fit(z_all)
+                            pc1_var = pca.explained_variance_ratio_[0] * 100
+                            pc2_var = pca.explained_variance_ratio_[1] * 100 if n_components > 1 else 0
+                            
+                            # Calculate intrinsic dimensionality (participation ratio)
+                            var_ratios = pca.explained_variance_ratio_
+                            intrinsic_dim = (var_ratios.sum()**2) / (var_ratios**2).sum()
+                            
+                            print(f"  → Latent Space: PC1={pc1_var:.1f}%, PC2={pc2_var:.1f}%, Intrinsic Dim={intrinsic_dim:.1f}/{LATENT_DIM}")
+                            
+                            # Warning if collapse detected
+                            if pc1_var > 90.0 and epoch > BETA_ANNEAL_EPOCHS:
+                                print(f"  ⚠️  Posterior collapse detected! PC1 dominates with {pc1_var:.1f}%")
         
         scheduler.step()
         
@@ -1137,7 +1217,7 @@ def compute_wl_similarity(G1, G2):
         graphs_pair = graph_from_networkx([G1_local, G2_local], node_labels_tag='label')
         
         # Compute WL kernel
-        wl_kernel = WeisfeilerLehman(n_iter=5, normalize=True, base_graph_kernel=VertexHistogram)
+        wl_kernel = WeisfeilerLehman(n_iter=10, normalize=True, base_graph_kernel=VertexHistogram)
         K = wl_kernel.fit_transform(graphs_pair)
         
         # Similarity is off-diagonal element

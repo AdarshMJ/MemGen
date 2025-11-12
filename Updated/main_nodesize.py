@@ -51,7 +51,7 @@ from main_comparison import (
 
 # Configuration
 FIXED_N = 500  # Fixed training set size - always use 1000 graphs from S1 and S2
-NODE_SIZES = [20,50,100,500]  # Graph complexities to test (loop over n)
+NODE_SIZES = [20,500]  # Graph complexities to test (loop over n)
 TEST_SET_SIZE = 10  # Conditioning graphs
 SPLIT_SEED = 42
 
@@ -72,10 +72,17 @@ TIMESTEPS = 500
 NUM_SAMPLES_PER_CONDITION = 5
 K_NEAREST = 1  # shortlist size for k-nearest training comparisons
 
-BETA_KL_WEIGHT = 0.05
+BETA_KL_WEIGHT = 0.5  # Increased from 0.05 to prevent posterior collapse
 SMALL_DATASET_THRESHOLD = 50
-SMALL_DATASET_KL_WEIGHT = 0.01
+SMALL_DATASET_KL_WEIGHT = 1.0  # Increased from 0.2 - small datasets need stronger KL penalty
 SMALL_DATASET_DROPOUT = 0.1
+LAMBDA_DIVERSITY = 0.5  # Spectral diversity regularization to prevent collapse
+
+# β-Annealing parameters (prevents posterior collapse)
+BETA_ANNEALING = True  # Enable gradual beta increase
+BETA_START = 0.0  # Start with pure reconstruction
+BETA_ANNEAL_EPOCHS = 50  # Gradually increase beta over first 50 epochs
+
 USE_BIAS = False  # Default: use bias in all models (can be overridden via --no-bias)
 
 # Device detection: TPU > CUDA > CPU
@@ -560,14 +567,44 @@ def _load_precomputed_splits(n_nodes, data_path, test_size, seed, stats_cache_pa
 
 def train_autoencoder(data_list, run_name, output_dir):
     """Train VGAE (imported logic from main_comparison.py)."""
-    from main_comparison import train_autoencoder as train_ae_original
-    return train_ae_original(data_list, run_name, output_dir)
+    import main_comparison
+    
+    # Inject hyperparameters from main_nodesize into main_comparison module
+    main_comparison.BETA_KL_WEIGHT = BETA_KL_WEIGHT
+    main_comparison.SMALL_DATASET_KL_WEIGHT = SMALL_DATASET_KL_WEIGHT
+    main_comparison.SMALL_DATASET_THRESHOLD = SMALL_DATASET_THRESHOLD
+    main_comparison.SMALL_DATASET_DROPOUT = SMALL_DATASET_DROPOUT
+    main_comparison.LAMBDA_DIVERSITY = LAMBDA_DIVERSITY
+    main_comparison.BETA_ANNEALING = BETA_ANNEALING
+    main_comparison.BETA_START = BETA_START
+    main_comparison.BETA_ANNEAL_EPOCHS = BETA_ANNEAL_EPOCHS
+    main_comparison.HIDDEN_DIM_ENCODER = HIDDEN_DIM_ENCODER
+    main_comparison.HIDDEN_DIM_DECODER = HIDDEN_DIM_DECODER
+    main_comparison.LATENT_DIM = LATENT_DIM
+    main_comparison.EPOCHS_AUTOENCODER = EPOCHS_AUTOENCODER
+    main_comparison.EARLY_STOPPING_PATIENCE = EARLY_STOPPING_PATIENCE
+    main_comparison.LEARNING_RATE = LEARNING_RATE
+    main_comparison.GRAD_CLIP = GRAD_CLIP
+    main_comparison.BATCH_SIZE = BATCH_SIZE
+    main_comparison.N_MAX_NODES = N_MAX_NODES
+    
+    return main_comparison.train_autoencoder(data_list, run_name, output_dir)
 
 
 def train_denoiser(autoencoder, data_list, run_name, output_dir):
     """Train denoiser (imported logic from main_comparison.py)."""
-    from main_comparison import train_denoiser as train_dn_original
-    return train_dn_original(autoencoder, data_list, run_name, output_dir)
+    import main_comparison
+    
+    # Inject hyperparameters from main_nodesize into main_comparison module
+    main_comparison.HIDDEN_DIM_DENOISE = HIDDEN_DIM_DENOISE
+    main_comparison.TIMESTEPS = TIMESTEPS
+    main_comparison.EPOCHS_DENOISER = EPOCHS_DENOISER
+    main_comparison.LEARNING_RATE = LEARNING_RATE
+    main_comparison.GRAD_CLIP = GRAD_CLIP
+    main_comparison.BATCH_SIZE = BATCH_SIZE
+    main_comparison.EARLY_STOPPING_PATIENCE = EARLY_STOPPING_PATIENCE
+    
+    return main_comparison.train_denoiser(autoencoder, data_list, run_name, output_dir)
 
 
 def generate_graphs(autoencoder, denoise_model, conditioning_stats, betas, num_samples=1):

@@ -8,47 +8,83 @@ from torch_geometric.nn import GINConv, GCNConv, GraphConv, PNAConv
 from torch_geometric.nn import global_add_pool
 
 
-# Decoder
+# Decoder (Inner Product Decoder - much more efficient)
 class Decoder(nn.Module):
-    def __init__(self, latent_dim, hidden_dim, n_layers, n_nodes, use_bias=True):
+    def __init__(self, latent_dim, hidden_dim, n_layers, n_nodes, use_bias=True, node_embed_dim=64):
+        """
+        Improved decoder using node embeddings and inner product.
+        
+        Instead of predicting all n*(n-1)/2 edges directly (124,750 for n=500),
+        we predict n node embeddings (500 * 64 = 32,000 parameters) and compute
+        edge probabilities as inner products between node embeddings.
+        
+        This reduces parameters and adds graph structure inductive bias.
+        """
         super(Decoder, self).__init__()
         self.n_layers = n_layers
         self.n_nodes = n_nodes
-        self.n_edges_ut = n_nodes * (n_nodes - 1) // 2  # upper-triangular (no diag)
-
-        mlp_layers = [nn.Linear(latent_dim, hidden_dim, bias=use_bias)] + [nn.Linear(hidden_dim, hidden_dim, bias=use_bias) for i in range(n_layers-2)]
-        # Single logit per upper-tri edge
-        mlp_layers.append(nn.Linear(hidden_dim, self.n_edges_ut, bias=use_bias))
-
+        self.node_embed_dim = node_embed_dim
+        
+        # MLP to generate node embeddings from latent code
+        mlp_layers = [nn.Linear(latent_dim, hidden_dim, bias=use_bias)]
+        for i in range(n_layers - 2):
+            mlp_layers.append(nn.Linear(hidden_dim, hidden_dim, bias=use_bias))
+        # Output: n_nodes * node_embed_dim parameters
+        mlp_layers.append(nn.Linear(hidden_dim, n_nodes * node_embed_dim, bias=use_bias))
+        
         self.mlp = nn.ModuleList(mlp_layers)
         self.relu = nn.ReLU()
+        
+        # Optional: learnable scaling for edge logits
+        self.edge_scale = nn.Parameter(torch.tensor(1.0))
+        # Learnable bilinear matrix to increase expressivity: u_i^T W u_j
+        self.bilinear_W = nn.Parameter(torch.empty(self.node_embed_dim, self.node_embed_dim))
+        nn.init.xavier_uniform_(self.bilinear_W)
+        # Per-node additive bias to capture degree/popularity
+        self.node_bias = nn.Parameter(torch.zeros(n_nodes))
 
     def forward(self, x, return_logits: bool = False, use_soft_sampling: bool = False):
-        # return_logits=True: return full symmetric logits adjacency
-        # use_soft_sampling=True: return probabilities via sigmoid (for generation)
-        for i in range(self.n_layers-1):
+        """
+        Args:
+            x: latent code (B, latent_dim)
+        Returns:
+            adj_logits or adj_probs: (B, n_nodes, n_nodes)
+        """
+        # Pass through MLP
+        for i in range(self.n_layers - 1):
             x = self.relu(self.mlp[i](x))
-
-        edge_ut_logits = self.mlp[self.n_layers-1](x)  # (B, n_edges_ut)
-
-        # Build full symmetric matrix of logits
-        B = edge_ut_logits.size(0)
-        adj_logits = torch.zeros(B, self.n_nodes, self.n_nodes, device=edge_ut_logits.device)
-        idx = torch.triu_indices(self.n_nodes, self.n_nodes, 1)
-        adj_logits[:, idx[0], idx[1]] = edge_ut_logits
-        adj_logits = adj_logits + adj_logits.transpose(1, 2)
-        # Strongly mask diagonal to avoid self-loops
-        diag_mask = torch.eye(self.n_nodes, device=adj_logits.device).unsqueeze(0)
-        adj_logits = adj_logits.masked_fill(diag_mask.bool(), -10.0)
-
+        
+        # Final layer outputs node embeddings
+        node_embeds_flat = self.mlp[self.n_layers - 1](x)  # (B, n_nodes * node_embed_dim)
+        
+        B = node_embeds_flat.size(0)
+        # Reshape to (B, n_nodes, node_embed_dim)
+        node_embeds = node_embeds_flat.view(B, self.n_nodes, self.node_embed_dim)
+        
+        # Compute edge logits as scaled inner product: adj[i,j] = scale * <embed[i], embed[j]>
+        adj_logits = torch.bmm(node_embeds, node_embeds.transpose(1, 2))  # (B, n_nodes, n_nodes)
+        adj_logits = adj_logits * self.edge_scale
+        
+        # Mask diagonal to prevent self-loops
+        diag_mask = torch.eye(self.n_nodes, device=adj_logits.device).unsqueeze(0).bool()
+        adj_logits = adj_logits.masked_fill(diag_mask, -10.0)
+        # Add bilinear term and per-node biases: scale * (E W E^T) + b_i + b_j
+        # Compute bilinear product: E (B, n, d) @ W (d, d) = (B, n, d), then @ E^T (B, d, n) = (B, n, n)
+        bilinear = torch.bmm(torch.matmul(node_embeds, self.bilinear_W), node_embeds.transpose(1, 2))
+        # bilinear now (B, n_nodes, n_nodes)
+        adj_logits = adj_logits + self.edge_scale * bilinear
+        # add per-node biases (broadcast)
+        b_i = self.node_bias.unsqueeze(0).unsqueeze(2)  # (1, n_nodes, 1)
+        b_j = self.node_bias.unsqueeze(0).unsqueeze(1)  # (1, 1, n_nodes)
+        adj_logits = adj_logits + b_i + b_j
+        
         if return_logits:
             return adj_logits
-
+        
         if use_soft_sampling:
-            # Return probabilities for generation
             return torch.sigmoid(adj_logits)
-
-        # Default: return hard thresholded adjacency (not used for loss)
+        
+        # Default: hard threshold
         return (torch.sigmoid(adj_logits) > 0.5).float()
 
 
@@ -474,7 +510,7 @@ class AutoEncoder(nn.Module):
 
 # Variational Autoencoder
 class VariationalAutoEncoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim_enc, hidden_dim_dec, latent_dim, n_layers_enc, n_layers_dec, n_max_nodes, use_bias=True):
+    def __init__(self, input_dim, hidden_dim_enc, hidden_dim_dec, latent_dim, n_layers_enc, n_layers_dec, n_max_nodes, use_bias=True, node_embed_dim=64):
         super(VariationalAutoEncoder, self).__init__()
         self.n_max_nodes = n_max_nodes
         self.input_dim = input_dim
@@ -483,7 +519,7 @@ class VariationalAutoEncoder(nn.Module):
         #self.encoder = Powerful(input_dim=input_dim+1, num_layers=n_layers_enc, hidden=hidden_dim_enc, hidden_final=hidden_dim_enc, dropout_prob=0.0, simplified=False)
         self.fc_mu = nn.Linear(hidden_dim_enc, latent_dim, bias=use_bias)
         self.fc_logvar = nn.Linear(hidden_dim_enc, latent_dim, bias=use_bias)
-        self.decoder = Decoder(latent_dim, hidden_dim_dec, n_layers_dec, n_max_nodes, use_bias=use_bias)
+        self.decoder = Decoder(latent_dim, hidden_dim_dec, n_layers_dec, n_max_nodes, use_bias=use_bias, node_embed_dim=node_embed_dim)
 
     def forward(self, data):
         x_g = self.encoder(data)
@@ -548,12 +584,16 @@ class VariationalAutoEncoder(nn.Module):
             neg = (mask.sum() - pos).clamp(min=1.0)
             pos_weight = (neg / (pos.clamp(min=1.0))).detach()
 
-        # BCE with logits on masked entries
+        # BCE with logits on masked entries (per-entry)
         bce = F.binary_cross_entropy_with_logits(adj_logits, target, pos_weight=pos_weight, reduction='none')
-        recon = (bce * mask).sum()
+        recon_sum = (bce * mask).sum()
+        # Normalize reconstruction by number of valid entries to stabilize magnitude across batches/sizes
+        valid_entries = mask.sum().clamp(min=1.0)
+        recon = recon_sum / valid_entries
 
-        # KL term
-        kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        # KL term (sum over latent dims, average per sample)
+        kld_sum = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        kld = kld_sum / float(B)
         
         # Spectral diversity loss (prevents posterior collapse)
         diversity_loss = 0.0

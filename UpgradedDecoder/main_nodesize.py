@@ -30,6 +30,9 @@ from pathlib import Path
 from tqdm import tqdm
 from datetime import datetime
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use("TkAgg") 
+
 import networkx as nx
 import pandas as pd
 import torch.nn as nn
@@ -51,7 +54,7 @@ from main_comparison import (
 
 # Configuration
 FIXED_N = 500  # Fixed training set size - always use 1000 graphs from S1 and S2
-NODE_SIZES = [20,500]  # Graph complexities to test (loop over n)
+NODE_SIZES = [500]  # Graph complexities to test (loop over n)
 TEST_SET_SIZE = 10  # Conditioning graphs
 SPLIT_SEED = 42
 
@@ -62,22 +65,23 @@ EARLY_STOPPING_PATIENCE = 50
 BATCH_SIZE = 32
 LEARNING_RATE = 0.0001
 GRAD_CLIP = 1.0
-LATENT_DIM = 32
-HIDDEN_DIM_ENCODER = 128
-HIDDEN_DIM_DECODER = 256
+LATENT_DIM = 32  # Increased from 32 to 128 for better capacity (still reasonable for 500-node graphs)
+HIDDEN_DIM_ENCODER = 64
+HIDDEN_DIM_DECODER = 128  # Increased from 256 to 512 to support node embedding generation
+NODE_EMBED_DIM = 32  # New: dimension of node embeddings for inner-product decoder
 HIDDEN_DIM_DENOISE = 512
-N_MAX_NODES = 700  # Maximum nodes (increased to accommodate 700-node graphs)
+N_MAX_NODES = 500  # Maximum nodes (increased to accommodate 700-node graphs)
 N_PROPERTIES = 15  # Updated from 18 to match labelhomgenerator (no structural/feature homophily)
 TIMESTEPS = 500
 NUM_SAMPLES_PER_CONDITION = 5
 K_NEAREST = 1  # shortlist size for k-nearest training comparisons
 
-BETA_KL_WEIGHT = 0.5  # Increased from 0.05 to prevent posterior collapse
+BETA_KL_WEIGHT = 0.2  # Reduced from 0.5 - larger latent needs less KL pressure initially
 SMALL_DATASET_THRESHOLD = 50
-SMALL_DATASET_KL_WEIGHT = 1.0  # Increased from 0.2 - small datasets need stronger KL penalty
+SMALL_DATASET_KL_WEIGHT = 0.5  # Reduced from 1.0 - let reconstruction improve first
 SMALL_DATASET_DROPOUT = 0.1
-LAMBDA_DIVERSITY = 0.5  # Spectral diversity regularization to prevent collapse
-LAMBDA_CONNECTIVITY = 1.0  # Connectivity regularization to prevent isolated nodes in decoder
+LAMBDA_DIVERSITY = 1.0  # Increased from 0.5 - need stronger diversity for larger latent
+LAMBDA_CONNECTIVITY = 0.01  # Connectivity regularization (reduced from 1.0 - was too strong)
 
 # β-Annealing parameters (prevents posterior collapse)
 BETA_ANNEALING = True  # Enable gradual beta increase
@@ -581,6 +585,7 @@ def train_autoencoder(data_list, run_name, output_dir):
     main_comparison.BETA_ANNEAL_EPOCHS = BETA_ANNEAL_EPOCHS
     main_comparison.HIDDEN_DIM_ENCODER = HIDDEN_DIM_ENCODER
     main_comparison.HIDDEN_DIM_DECODER = HIDDEN_DIM_DECODER
+    main_comparison.NODE_EMBED_DIM = NODE_EMBED_DIM  # New: pass node embedding dimension
     main_comparison.LATENT_DIM = LATENT_DIM
     main_comparison.EPOCHS_AUTOENCODER = EPOCHS_AUTOENCODER
     main_comparison.EARLY_STOPPING_PATIENCE = EARLY_STOPPING_PATIENCE

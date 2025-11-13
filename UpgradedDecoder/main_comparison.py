@@ -27,7 +27,7 @@ from tqdm import tqdm
 from datetime import datetime
 import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("TkAgg") 
 import networkx as nx
 import pandas as pd
 
@@ -616,6 +616,9 @@ def train_autoencoder(data_list, run_name, output_dir):
     # Get feature dimension
     input_feat_dim = data_list[0].x.shape[1]
     
+    # Get node_embed_dim if available (for improved inner-product decoder)
+    node_embed_dim = globals().get('NODE_EMBED_DIM', 64)
+    
     # Create model
     autoencoder = VariationalAutoEncoder(
         input_dim=input_feat_dim,
@@ -625,7 +628,8 @@ def train_autoencoder(data_list, run_name, output_dir):
         n_layers_enc=2,
         n_layers_dec=3,
         n_max_nodes=N_MAX_NODES,
-        use_bias=USE_BIAS if 'USE_BIAS' in globals() else False
+        use_bias=USE_BIAS if 'USE_BIAS' in globals() else False,
+        node_embed_dim=node_embed_dim
     ).to(device)
     
     dataset_size = len(data_list)
@@ -1218,7 +1222,7 @@ def compute_wl_similarity(G1, G2):
         graphs_pair = graph_from_networkx([G1_local, G2_local], node_labels_tag='label')
         
         # Compute WL kernel
-        wl_kernel = WeisfeilerLehman(n_iter=10, normalize=True, base_graph_kernel=VertexHistogram)
+        wl_kernel = WeisfeilerLehman(n_iter=5, normalize=True, base_graph_kernel=VertexHistogram)
         K = wl_kernel.fit_transform(graphs_pair)
         
         # Similarity is off-diagonal element

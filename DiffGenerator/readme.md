@@ -1,4 +1,4 @@
-Different model to generate graphs.
+Different model to generate graphs. Original code base - https://github.com/harryjo97/GruM/tree/master/GruM_2D
 
 
 #### Run code using

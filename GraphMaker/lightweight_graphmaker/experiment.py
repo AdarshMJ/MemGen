@@ -168,6 +168,26 @@ def run_experiment(node_size,
         output_dir=vis_dir  # Pass output directory for visualizations
     )
     
+    # ========== STEP 7: Compute Graph Statistics MSE ==========
+    print("\n" + "="*80)
+    print("STEP 7: Computing Graph Statistics MSE with Test Set")
+    print("="*80)
+    
+    from graph_stats import compute_mse_with_test
+    
+    # Compute MSE for Gen1 vs Test
+    print("\nGen1 (DF1) vs Test:")
+    test_path = f'data/node_{node_size}/test.pt'
+    mse_results_gen1, _, _ = compute_mse_with_test(gen1_graphs, test_path, verbose=True)
+    
+    # Compute MSE for Gen2 vs Test
+    print("\nGen2 (DF2) vs Test:")
+    mse_results_gen2, _, _ = compute_mse_with_test(gen2_graphs, test_path, verbose=True)
+    
+    # Add to results
+    results['Gen1_stats_mse'] = mse_results_gen1
+    results['Gen2_stats_mse'] = mse_results_gen2
+    
     # Add training losses to results
     results['DF1_final_loss'] = trainer_df1.train_losses[-1]
     results['DF2_final_loss'] = trainer_df2.train_losses[-1]
@@ -185,12 +205,17 @@ def run_experiment(node_size,
     print(f"EXPERIMENT COMPLETE: node_size={node_size}")
     print("="*80)
     print(f"Experiment directory: {exp_dir}")
-    print(f"DF1 best loss: {results['DF1_best_loss']:.4f}")
-    print(f"DF2 best loss: {results['DF2_best_loss']:.4f}")
-    print(f"WLSim(Gen1, S1): {results['WLSim_Gen1_S1']:.4f}")
-    print(f"WLSim(Gen2, S2): {results['WLSim_Gen2_S2']:.4f}")
-    print(f"WLSim(Gen1, Gen2): {results['WLSim_Gen1_Gen2']:.4f}")
-    print(f"Gen/Mem Ratio: {results['gen_vs_mem_ratio']:.4f}")
+    print(f"\nTraining Losses:")
+    print(f"  DF1 best loss: {results['DF1_best_loss']:.4f}")
+    print(f"  DF2 best loss: {results['DF2_best_loss']:.4f}")
+    print(f"\nWL Similarity:")
+    print(f"  WLSim(Gen1, S1): {results['WLSim_Gen1_S1']:.4f}")
+    print(f"  WLSim(Gen2, S2): {results['WLSim_Gen2_S2']:.4f}")
+    print(f"  WLSim(Gen1, Gen2): {results['WLSim_Gen1_Gen2']:.4f}")
+    print(f"  Gen/Mem Ratio: {results['gen_vs_mem_ratio']:.4f}")
+    print(f"\nGraph Statistics MSE vs Test:")
+    print(f"  Gen1 overall MSE: {results['Gen1_stats_mse']['overall_mse']:.6f}")
+    print(f"  Gen2 overall MSE: {results['Gen2_stats_mse']['overall_mse']:.6f}")
     print("="*80 + "\n")
     
     return results, exp_dir

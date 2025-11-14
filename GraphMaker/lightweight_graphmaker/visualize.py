@@ -301,6 +301,14 @@ def create_comprehensive_visualization(gen1_graphs, gen2_graphs,
     )
     plt.close()
     
+    # 7. Gen1 vs Gen2 similarity heatmap
+    print("  7. Gen1 vs Gen2 similarity heatmap...")
+    plot_gen1_vs_gen2_similarity(
+        similarity_matrix=sim_matrix_g1_g2,
+        save_path=os.path.join(output_dir, 'gen1_vs_gen2_similarity.png')
+    )
+    plt.close()
+    
     print(f"\n✓ All visualizations saved to {output_dir}/")
 
 
@@ -358,6 +366,46 @@ if __name__ == "__main__":
     # Test visualization
     print("Testing visualization functions...")
     
+def plot_gen1_vs_gen2_similarity(similarity_matrix, save_path=None):
+    """
+    Plot heatmap showing WL similarity between Gen1 and Gen2 graphs
+    
+    Args:
+        similarity_matrix: numpy array of shape (num_gen1, num_gen2)
+        save_path: Path to save figure
+    """
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # Create heatmap
+    im = ax.imshow(similarity_matrix, cmap='viridis', aspect='auto', vmin=0, vmax=1)
+    
+    # Colorbar
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('WL Similarity', fontsize=18)
+    cbar.ax.tick_params(labelsize=14)
+    
+    # Labels
+    ax.set_xlabel('Gen2 Graphs (DF2 trained on S2)', fontsize=20)
+    ax.set_ylabel('Gen1 Graphs (DF1 trained on S1)', fontsize=20)
+    ax.tick_params(labelsize=14)
+    
+    # Add mean similarity as text
+    mean_sim = similarity_matrix.mean()
+    ax.text(0.02, 0.98, f'Mean Similarity: {mean_sim:.3f}',
+            transform=ax.transAxes,
+            fontsize=18,
+            verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved Gen1 vs Gen2 similarity heatmap to {save_path}")
+    
+    return fig
+
+
     from torch_geometric.data import Data
     
     # Create test graphs

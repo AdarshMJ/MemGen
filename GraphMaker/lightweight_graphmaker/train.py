@@ -12,9 +12,9 @@ import json
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from dataset import GraphDataset, collate_graphs, get_edge_marginals, get_label_marginals
-from diffusion import GraphDiffusion
-from model import BiasFreeDenoisingGNN
+from .dataset import GraphDataset, collate_graphs, get_edge_marginals, get_label_marginals
+from .diffusion import GraphDiffusion
+from .model import BiasFreeDenoisingGNN
 
 
 class DiffusionTrainer:

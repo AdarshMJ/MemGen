@@ -10,10 +10,10 @@ import json
 import argparse
 from datetime import datetime
 
-from train import train_model
-from sample import generate_from_checkpoint
-from dataset import GraphDataset
-from wl_kernel import evaluate_memorization_vs_generalization
+from .train import train_model
+from .sample import generate_from_checkpoint
+from .dataset import GraphDataset
+from .wl_kernel import evaluate_memorization_vs_generalization
 
 
 def run_experiment(node_size, 

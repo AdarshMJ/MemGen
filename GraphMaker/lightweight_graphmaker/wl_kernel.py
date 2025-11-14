@@ -244,7 +244,7 @@ def evaluate_memorization_vs_generalization(gen1_graphs, gen2_graphs,
     if output_dir is not None:
         print("Creating visualizations...")
         try:
-            from visualize import create_comprehensive_visualization
+            from .visualize import create_comprehensive_visualization
             
             create_comprehensive_visualization(
                 gen1_graphs=gen1_graphs,

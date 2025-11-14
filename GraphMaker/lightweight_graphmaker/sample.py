@@ -7,8 +7,8 @@ from torch_geometric.data import Data
 from tqdm import tqdm
 import os
 
-from diffusion import GraphDiffusion
-from model import BiasFreeDenoisingGNN
+from .diffusion import GraphDiffusion
+from .model import BiasFreeDenoisingGNN
 
 
 class GraphSampler:

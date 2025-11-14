@@ -27,3 +27,10 @@ python main_nodesize.py --no-bias
 ```python
 python evaluate_saved_models.py --checkpoint-dir outputs/nodesize_study/WL_iter=5 --node-sizes 20 --output-dir outputs/nodesize_study/WL_iter=5/evaluation_test --N 500 --k-nearest 1
 ```
+
+#### Train GraphMaker on own dataset
+```python
+   python lightweight_graphmaker/experiment.py \
+    --node_sizes 20 50 100 \
+    --num_generated 100
+```

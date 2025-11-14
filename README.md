@@ -19,6 +19,7 @@ python seeded_graph_generator.py \
 #### Train bias-free
 
 ```python
+cd/
 python main_nodesize.py --no-bias
 ```
 

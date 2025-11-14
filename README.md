@@ -34,3 +34,14 @@ python evaluate_saved_models.py --checkpoint-dir outputs/nodesize_study/WL_iter=
     --node_sizes 20 50 100 \
     --num_generated 100
 ```
+
+#### Jacobian
+
+```python
+  python run_jacobian_analysis.py \
+    --checkpoint experiments/n100_20251114_121458/checkpoints/DF1_n100_best.pt \
+    --node_size 100 \
+    --split S1 \
+    --num_samples 50 \
+    --output_dir jacobian_analysis/DF1_n100
+```

@@ -1,0 +1,387 @@
+"""
+Visualization utilities for generated graphs and WL similarity analysis
+"""
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import networkx as nx
+from torch_geometric.data import Data
+from torch_geometric.utils import to_networkx
+import os
+
+
+def visualize_graph(graph, ax=None, title="", node_size=300, font_size=10):
+    """
+    Visualize a single graph with node colors based on labels
+    
+    Args:
+        graph: PyG Data object or NetworkX graph
+        ax: Matplotlib axis (if None, create new figure)
+        title: Plot title
+        node_size: Size of nodes
+        font_size: Font size for labels
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 6))
+    
+    # Convert to NetworkX if needed
+    if isinstance(graph, Data):
+        G = to_networkx(graph, to_undirected=True)
+        node_labels = graph.y.cpu().numpy() if graph.y is not None else None
+    else:
+        G = graph
+        node_labels = [G.nodes[i].get('label', 0) for i in G.nodes()]
+    
+    # Layout
+    pos = nx.spring_layout(G, seed=42, k=0.5, iterations=50)
+    
+    # Color map
+    if node_labels is not None:
+        unique_labels = np.unique(node_labels)
+        colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
+        color_map = {label: colors[i] for i, label in enumerate(unique_labels)}
+        node_colors = [color_map[label] for label in node_labels]
+    else:
+        node_colors = 'lightblue'
+    
+    # Draw
+    nx.draw_networkx_nodes(G, pos, node_color=node_colors, 
+                          node_size=node_size, ax=ax, alpha=0.9)
+    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.5, width=1.5)
+    
+    # Optional: draw node labels
+    # nx.draw_networkx_labels(G, pos, ax=ax, font_size=8)
+    
+    ax.set_title(title, fontsize=font_size)
+    ax.axis('off')
+
+
+def visualize_graph_pairs(gen_graphs, train_graphs, closest_indices, 
+                         closest_similarities, num_pairs=5, save_path=None):
+    """
+    Visualize generated graphs alongside their closest training matches
+    
+    Args:
+        gen_graphs: List of generated graphs
+        train_graphs: List of training graphs
+        closest_indices: Indices of closest training graphs
+        closest_similarities: Similarity scores
+        num_pairs: Number of pairs to visualize
+        save_path: Path to save figure
+    """
+    num_pairs = min(num_pairs, len(gen_graphs))
+    
+    fig, axes = plt.subplots(num_pairs, 2, figsize=(12, 4 * num_pairs))
+    if num_pairs == 1:
+        axes = axes.reshape(1, -1)
+    
+    for i in range(num_pairs):
+        gen_graph = gen_graphs[i]
+        train_idx = closest_indices[i]
+        train_graph = train_graphs[train_idx]
+        similarity = closest_similarities[i]
+        
+        # Generated graph
+        visualize_graph(gen_graph, ax=axes[i, 0], 
+                       title=f"Generated #{i}\n({gen_graph.num_nodes} nodes, {gen_graph.num_edges} edges)")
+        
+        # Closest training graph
+        visualize_graph(train_graph, ax=axes[i, 1],
+                       title=f"Closest Match (Train #{train_idx})\nWL Sim: {similarity:.3f}")
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved visualization to {save_path}")
+    
+    return fig
+
+
+def plot_wl_similarity_histogram(gen_train_sims, gen1_gen2_sims=None,
+                                 labels=None, save_path=None):
+    """
+    Plot histogram of WL similarities (like the example images)
+    
+    Args:
+        gen_train_sims: Array or list of Gen-Train similarities (memorization)
+        gen1_gen2_sims: Array or list of Gen1-Gen2 similarities (generalization)
+        labels: List of labels for the distributions
+        save_path: Path to save figure
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Plot memorization (Gen vs Train)
+    if gen_train_sims is not None:
+        ax.hist(gen_train_sims, bins=30, alpha=0.7, color='orange', 
+               label='Memorization', edgecolor='black', linewidth=1.2)
+        mean_mem = np.mean(gen_train_sims)
+        ax.axvline(mean_mem, color='orange', linestyle='--', linewidth=2.5,
+                  label=f'Mean: {mean_mem:.2f}')
+        
+        # Add text box with mean
+        ax.text(mean_mem + 0.02, ax.get_ylim()[1] * 0.95, f'{mean_mem:.2f}',
+               fontsize=16, color='orange', fontweight='bold',
+               bbox=dict(boxstyle='round', facecolor='white', edgecolor='orange', linewidth=2))
+    
+    # Plot generalization (Gen1 vs Gen2)
+    if gen1_gen2_sims is not None:
+        ax.hist(gen1_gen2_sims, bins=30, alpha=0.7, color='blue',
+               label='Generalization', edgecolor='black', linewidth=1.2)
+        mean_gen = np.mean(gen1_gen2_sims)
+        ax.axvline(mean_gen, color='blue', linestyle='--', linewidth=2.5,
+                  label=f'Mean: {mean_gen:.2f}')
+        
+        # Add text box with mean
+        ax.text(mean_gen + 0.02, ax.get_ylim()[1] * 0.85, f'{mean_gen:.2f}',
+               fontsize=16, color='blue', fontweight='bold',
+               bbox=dict(boxstyle='round', facecolor='white', edgecolor='blue', linewidth=2))
+    
+    ax.set_xlabel('WL Similarity', fontsize=25)
+    ax.set_ylabel('Density', fontsize=25)
+    ax.tick_params(labelsize=20)
+    ax.legend(fontsize=20, loc='upper left')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved histogram to {save_path}")
+    
+    return fig
+
+
+def plot_similarity_distribution_comparison(results_dict, save_path=None):
+    """
+    Create a 4-panel comparison of similarity distributions for different node sizes
+    
+    Args:
+        results_dict: Dict with node sizes as keys, each containing similarity arrays
+        save_path: Path to save figure
+    """
+    node_sizes = sorted(results_dict.keys())
+    n_plots = len(node_sizes)
+    
+    fig, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, 6))
+    if n_plots == 1:
+        axes = [axes]
+    
+    for idx, (node_size, data) in enumerate(sorted(results_dict.items())):
+        ax = axes[idx]
+        
+        # Extract data
+        mem_sims = data.get('memorization_sims', [])
+        gen_sims = data.get('generalization_sims', [])
+        
+        # Plot histograms
+        if len(mem_sims) > 0:
+            ax.hist(mem_sims, bins=20, alpha=0.7, color='orange',
+                   label='Memorization', edgecolor='black', linewidth=1)
+            mean_mem = np.mean(mem_sims)
+            ax.axvline(mean_mem, color='orange', linestyle='--', linewidth=2)
+            ax.text(mean_mem + 0.02, ax.get_ylim()[1] * 0.95, f'{mean_mem:.2f}',
+                   fontsize=14, color='orange', fontweight='bold',
+                   bbox=dict(boxstyle='round', facecolor='white', 
+                           edgecolor='orange', linewidth=2))
+        
+        if len(gen_sims) > 0:
+            ax.hist(gen_sims, bins=20, alpha=0.7, color='blue',
+                   label='Generalization', edgecolor='black', linewidth=1)
+            mean_gen = np.mean(gen_sims)
+            ax.axvline(mean_gen, color='blue', linestyle='--', linewidth=2)
+            ax.text(mean_gen + 0.02, ax.get_ylim()[1] * 0.85, f'{mean_gen:.2f}',
+                   fontsize=14, color='blue', fontweight='bold',
+                   bbox=dict(boxstyle='round', facecolor='white',
+                           edgecolor='blue', linewidth=2))
+        
+        ax.set_xlabel('WL Similarity', fontsize=20)
+        ax.set_ylabel('Density', fontsize=20)
+        ax.set_title(f'n={node_size}', fontsize=22, fontweight='bold')
+        ax.tick_params(labelsize=16)
+        ax.legend(fontsize=16)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(0, 1)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved comparison plot to {save_path}")
+    
+    return fig
+
+
+def create_comprehensive_visualization(gen1_graphs, gen2_graphs,
+                                       s1_graphs, s2_graphs,
+                                       closest_indices_g1_s1,
+                                       closest_indices_g2_s2,
+                                       closest_sims_g1_s1,
+                                       closest_sims_g2_s2,
+                                       sim_matrix_g1_g2,
+                                       output_dir='visualizations'):
+    """
+    Create comprehensive visualization suite
+    
+    Args:
+        gen1_graphs: Graphs generated by DF1
+        gen2_graphs: Graphs generated by DF2
+        s1_graphs: Training set S1
+        s2_graphs: Training set S2
+        closest_indices_g1_s1: Closest S1 matches for Gen1
+        closest_indices_g2_s2: Closest S2 matches for Gen2
+        closest_sims_g1_s1: Similarities for Gen1-S1
+        closest_sims_g2_s2: Similarities for Gen2-S2
+        sim_matrix_g1_g2: Similarity matrix between Gen1 and Gen2
+        output_dir: Directory to save visualizations
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    print(f"\nCreating comprehensive visualizations in {output_dir}/")
+    
+    # 1. Visualize Gen1 with closest S1 matches
+    print("  1. Gen1 vs S1 closest matches...")
+    visualize_graph_pairs(
+        gen1_graphs, s1_graphs,
+        closest_indices_g1_s1, closest_sims_g1_s1,
+        num_pairs=5,
+        save_path=os.path.join(output_dir, 'gen1_vs_s1_matches.png')
+    )
+    plt.close()
+    
+    # 2. Visualize Gen2 with closest S2 matches
+    print("  2. Gen2 vs S2 closest matches...")
+    visualize_graph_pairs(
+        gen2_graphs, s2_graphs,
+        closest_indices_g2_s2, closest_sims_g2_s2,
+        num_pairs=5,
+        save_path=os.path.join(output_dir, 'gen2_vs_s2_matches.png')
+    )
+    plt.close()
+    
+    # 3. Histogram of Gen1-S1 similarities (memorization)
+    print("  3. Gen1-S1 similarity histogram...")
+    plot_wl_similarity_histogram(
+        closest_sims_g1_s1,
+        gen1_gen2_sims=None,
+        save_path=os.path.join(output_dir, 'hist_gen1_s1.png')
+    )
+    plt.close()
+    
+    # 4. Histogram of Gen2-S2 similarities (memorization)
+    print("  4. Gen2-S2 similarity histogram...")
+    plot_wl_similarity_histogram(
+        closest_sims_g2_s2,
+        gen1_gen2_sims=None,
+        save_path=os.path.join(output_dir, 'hist_gen2_s2.png')
+    )
+    plt.close()
+    
+    # 5. Combined memorization vs generalization histogram
+    print("  5. Memorization vs Generalization histogram...")
+    
+    # Average memorization
+    all_mem_sims = np.concatenate([closest_sims_g1_s1, closest_sims_g2_s2])
+    
+    # Generalization: flatten Gen1-Gen2 similarity matrix
+    gen1_gen2_sims = sim_matrix_g1_g2.flatten()
+    
+    plot_wl_similarity_histogram(
+        all_mem_sims,
+        gen1_gen2_sims=gen1_gen2_sims,
+        save_path=os.path.join(output_dir, 'hist_memorization_vs_generalization.png')
+    )
+    plt.close()
+    
+    # 6. Summary statistics plot
+    print("  6. Summary statistics...")
+    create_summary_plot(
+        closest_sims_g1_s1, closest_sims_g2_s2, sim_matrix_g1_g2,
+        save_path=os.path.join(output_dir, 'summary_statistics.png')
+    )
+    plt.close()
+    
+    print(f"\n✓ All visualizations saved to {output_dir}/")
+
+
+def create_summary_plot(sims_g1_s1, sims_g2_s2, sim_matrix_g1_g2, save_path=None):
+    """
+    Create a summary plot with box plots and statistics
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Prepare data
+    mem_g1 = sims_g1_s1
+    mem_g2 = sims_g2_s2
+    gen = sim_matrix_g1_g2.flatten()
+    
+    # Box plot
+    positions = [1, 2, 3.5]
+    box_data = [mem_g1, mem_g2, gen]
+    labels = ['Gen1 vs S1\n(Memorization)', 'Gen2 vs S2\n(Memorization)', 
+             'Gen1 vs Gen2\n(Generalization)']
+    colors = ['orange', 'orange', 'blue']
+    
+    bp = ax.boxplot(box_data, positions=positions, labels=labels,
+                    patch_artist=True, widths=0.6)
+    
+    for patch, color in zip(bp['boxes'], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.6)
+    
+    # Add means as red diamonds
+    means = [np.mean(d) for d in box_data]
+    ax.scatter(positions, means, color='red', marker='D', s=100, 
+              zorder=3, label='Mean')
+    
+    # Add text annotations
+    for pos, mean in zip(positions, means):
+        ax.text(pos, mean + 0.05, f'{mean:.3f}', 
+               ha='center', fontsize=14, fontweight='bold')
+    
+    ax.set_ylabel('WL Similarity', fontsize=20)
+    ax.tick_params(labelsize=16)
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.legend(fontsize=14)
+    ax.set_ylim(0, 1)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved summary plot to {save_path}")
+    
+    return fig
+
+
+if __name__ == "__main__":
+    # Test visualization
+    print("Testing visualization functions...")
+    
+    from torch_geometric.data import Data
+    
+    # Create test graphs
+    def create_test_graph(num_nodes, num_edges, label_range=3):
+        edge_index = torch.randint(0, num_nodes, (2, num_edges))
+        y = torch.randint(0, label_range, (num_nodes,))
+        return Data(edge_index=edge_index, y=y, num_nodes=num_nodes)
+    
+    gen_graphs = [create_test_graph(20, 25) for _ in range(10)]
+    train_graphs = [create_test_graph(20, 30) for _ in range(20)]
+    
+    # Test single graph visualization
+    print("Testing single graph visualization...")
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    visualize_graph(gen_graphs[0], ax=ax, title="Test Graph")
+    plt.savefig('test_single_graph.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print("✓ Saved test_single_graph.png")
+    
+    # Test histogram
+    print("Testing histogram...")
+    mem_sims = np.random.beta(5, 2, 100)  # Skewed toward higher values
+    gen_sims = np.random.beta(3, 3, 100)  # More centered
+    plot_wl_similarity_histogram(mem_sims, gen_sims, 
+                                 save_path='test_histogram.png')
+    plt.close()
+    print("✓ Saved test_histogram.png")
